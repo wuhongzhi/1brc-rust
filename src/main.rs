@@ -597,7 +597,7 @@ mod bench {
     }
     pub fn decode_lines<'a>(mut data: &'a [u8]) -> (u64, WeatherHashMap<'a>) {
         let mut batch = WeatherHashMap::with_capacity(10_000);
-        let mut recoreds = 0;
+        let mut records = 0;
         #[inline(always)]
         fn compute<'a>(batch: &mut WeatherHashMap<'a>, city: &'a [u8], temp: &'a [u8]) {
             batch
@@ -627,14 +627,14 @@ mod bench {
                 Some(p) => {
                     if !city.is_empty() {
                         compute(&mut batch, city, &data[..p]);
-                        recoreds += 1;
+                        records += 1;
                     }
                     data = &data[p + 1..];
                 }
                 None => break,
             }
         }
-        (recoreds, batch)
+        (records, batch)
     }
 
     #[inline(always)]
