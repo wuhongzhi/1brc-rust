@@ -27,7 +27,7 @@ enum Cli {
 #[derive(Args)]
 struct GenerateArg {
     /// Record size
-    #[arg(short, long, default_value_t = 1_000_000)]
+    #[arg(short, long, default_value_t = 100_000_000)]
     size: u64,
 
     /// cities used for data file
@@ -140,20 +140,20 @@ fn generate(argv: GenerateArg) -> Result<()> {
 
 fn bench(argv: BenchArg) -> Result<()> {
     let clock = SystemTime::now();
+    let mut buf = String::with_capacity(500_000);
 
     let mut pipe_fds = [0i32; 2];
     unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
-    let mut buf = String::with_capacity(300_000);
     match fork()? {
         Fork::Parent(_child) => {
             unsafe { libc::close(pipe_fds[1]) }; // Close write end
-            let mut reader = unsafe { std::fs::File::from_raw_fd(pipe_fds[0]) };
+            let mut reader = unsafe { File::from_raw_fd(pipe_fds[0]) };
             reader.read_to_string(&mut buf)?;
             stdout().write_all(buf.as_bytes())?;
         }
         Fork::Child => {
             unsafe { libc::close(pipe_fds[0]) }; // Close read end
-            let data = self::r#gen::Mmap::open::<false>(File::open(argv.data)?)?;
+            let data = Mmap::open::<false>(File::open(argv.data)?)?;
             let (records, result) = bench::reduce(&data)?;
             //format & detail report
             buf.push('{');
@@ -445,11 +445,12 @@ mod bench {
     }
     impl<'a> Hash for City<'a> {
         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-            if self.name.len() < 8 {
-                self.name.hash(state);
-            } else {
-                self.name[..8].hash(state);
-            }
+            self.name.hash(state);
+            // if self.name.len() < 8 {
+            //     self.name.hash(state);
+            // } else {
+            //     self.name[..8].hash(state);
+            // }
         }
     }
     impl<'a> PartialEq for City<'a> {
@@ -469,7 +470,7 @@ mod bench {
     }
     impl<'a> Display for City<'a> {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            f.write_str(str::from_utf8(self.name).unwrap())
+            f.write_str(unsafe { str::from_utf8_unchecked(self.name) })
         }
     }
 
@@ -614,6 +615,7 @@ mod bench {
                 })
                 .or_insert_with(|| Weather::new(parse_number(temp)));
         }
+
         const EMPTY: &[u8] = &[];
         while !data.is_empty() {
             let mut city = EMPTY;
