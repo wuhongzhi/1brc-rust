@@ -68,7 +68,6 @@ fn generate(argv: GenerateArg) -> Result<()> {
         data.as_bytes()
     };
     let cities: Vec<bench::City<'_>> = bench::decode_lines(data)
-        .1
         .into_keys()
         .take(argv.cities)
         .collect();
@@ -154,7 +153,7 @@ fn bench(argv: BenchArg) -> Result<()> {
         Fork::Child => {
             unsafe { libc::close(pipe_fds[0]) }; // Close read end
             let data = Mmap::open::<false>(File::open(argv.data)?)?;
-            let (records, result) = bench::reduce(&data)?;
+            let result = bench::reduce(&data)?;
             //format & detail report
             buf.push('{');
             for (id, (city, weather)) in result.iter().enumerate() {
@@ -166,7 +165,7 @@ fn bench(argv: BenchArg) -> Result<()> {
             buf.push_str("}\n");
             buf.push_str(
                 format!(
-                    "Result in {:.3}ms with {} cities {records} records\n",
+                    "Result in {:.3}ms with {} cities\n",
                     clock.elapsed()?.as_millis(),
                     result.len(),
                 )
@@ -445,27 +444,18 @@ mod bench {
     }
     impl<'a> Hash for City<'a> {
         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-            self.name.hash(state);
-            // if self.name.len() < 8 {
-            //     self.name.hash(state);
-            // } else {
-            //     self.name[..8].hash(state);
-            // }
+            // self.name.hash(state);
+            const MAX: usize = size_of::<u128>();
+            if self.name.len() > MAX {
+                self.name[..MAX].hash(state);
+            } else {
+                self.name.hash(state);
+            }
         }
     }
     impl<'a> PartialEq for City<'a> {
         fn eq(&self, other: &Self) -> bool {
-            self.name == other.name
-
-            // use libc::memcmp;
-            // self.name.len() == other.name.len()
-            //     && unsafe {
-            //         memcmp(
-            //             self.name.as_ptr() as *const _,
-            //             other.name.as_ptr() as *const _,
-            //             self.name.len(),
-            //         ) == 0
-            //     }
+            self.name.eq(other.name)
         }
     }
     impl<'a> Display for City<'a> {
@@ -489,23 +479,18 @@ mod bench {
     impl<'a> Scanner<'a> {
         fn new(data: &'a [u8], _parts: NonZeroUsize) -> Self {
             let mut v = vec![data];
-            // let parts = (data.len() / (1 << 20)).ilog2();
-            let parts = _parts.ilog2();
-            for _i in 0..parts {
-                let mut t = vec![];
+            // let parts = (data.len() / (1 << 20)).ilog2() as usize;
+            let parts = _parts.ilog2() as usize;
+            for i in 1..parts + 1 {
+                let mut t = Vec::with_capacity(i << 1);
                 for data in v {
-                    let end = data.len();
-                    if end > 2 {
-                        let mut i = end / 2;
-                        while i < end && peek!(data, i) != b'\n' {
-                            i += 1;
-                        }
-                        if i == end {
-                            t.push(data);
-                        } else {
-                            t.push(&data[..=i]);
-                            t.push(&data[i + 1..]);
-                        }
+                    let len = data.len() >> 1;
+                    if len > 1024
+                        && let Some(mut p) = find_newline(&data[len..])
+                    {
+                        p += len;
+                        t.push(&data[..=p]);
+                        t.push(&data[p + 1..]);
                     } else {
                         t.push(data);
                     }
@@ -530,7 +515,49 @@ mod bench {
 
     type WeatherHashMap<'a> = RapidHashMap<City<'a>, Weather>;
 
-    pub fn reduce(data: &[u8]) -> Result<(u64, BTreeMap<City<'_>, Weather>)> {
+    #[inline(always)]
+    fn find_with_mask<const MASK: usize, const CHR: u8>(data: &[u8]) -> Option<usize> {
+        let (mut i, end) = (0, data.len());
+        //boost performance with swar
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            const SIZE: usize = size_of::<usize>();
+            const MASK1: usize = usize::from_ne_bytes([0x01; SIZE]);
+            const MASK2: usize = usize::from_ne_bytes([0x80; SIZE]);
+            let p1 = data.as_ptr();
+            while i + SIZE < end {
+                let input = p1.add(i).cast::<usize>().read_volatile() ^ MASK;
+                let p = (input - MASK1) & !input & MASK2;
+                if p != 0 {
+                    return Some(i + (p.trailing_zeros() >> 3) as usize);
+                }
+                i += SIZE;
+            }
+        }
+        while i < end {
+            if peek!(data, i) == CHR {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    const CHR1: u8 = b';';
+    const CHR2: u8 = b'\n';
+    const MASK1: usize = usize::from_ne_bytes([CHR1; size_of::<usize>()]);
+    const MASK2: usize = usize::from_ne_bytes([CHR2; size_of::<usize>()]);
+
+    #[inline(always)]
+    fn find_comma(data: &[u8]) -> Option<usize> {
+        find_with_mask::<MASK1, CHR1>(data)
+    }
+    #[inline(always)]
+    fn find_newline(data: &[u8]) -> Option<usize> {
+        find_with_mask::<MASK2, CHR2>(data)
+    }
+
+    pub fn reduce(data: &[u8]) -> Result<BTreeMap<City<'_>, Weather>> {
         let (tasks, rx) = {
             let jobs = num_cpus::get_physical();
             let scanner = Arc::new(Scanner::new(
@@ -539,7 +566,7 @@ mod bench {
             ));
             let jobs = jobs.min(scanner.size());
             // eprintln!("Parallel {jobs} jobs reducing {} parts", scanner.size());
-            let (tx, rx) = channel::<Option<(u64, WeatherHashMap)>>();
+            let (tx, rx) = channel::<Option<WeatherHashMap>>();
             let mut tasks = vec![];
             for _ in 0..jobs {
                 let sc1 = scanner.clone();
@@ -556,13 +583,11 @@ mod bench {
             (tasks, rx)
         };
 
-        let mut records = 0;
         let mut finish = 0;
         let mut result = BTreeMap::new();
         while finish < tasks.len() {
             match rx.recv()? {
-                Some((r, batch)) => {
-                    records += r;
+                Some(batch) => {
                     for (city, value) in batch {
                         result
                             .entry(city)
@@ -577,28 +602,11 @@ mod bench {
         // just wait all, normal they all down here.
         tasks.into_iter().for_each(|t| t.join().unwrap());
 
-        Ok((records, result))
+        Ok(result)
     }
 
-    #[inline(always)]
-    fn find_chr(data: &[u8], chr: u8) -> Option<usize> {
-        // let (mut i, end) = (0, data.len());
-        // while i < end && peek!(data, i) != chr {
-        //     i += 1;
-        // }
-        // if i == end { None } else { Some(i) }
-
-        let p1 = data.as_ptr();
-        let p2 = unsafe { libc::memchr(p1 as *const _, chr as _, data.len()) };
-        if !p2.is_null() {
-            Some(p2.addr() - p1.addr())
-        } else {
-            None
-        }
-    }
-    pub fn decode_lines<'a>(mut data: &'a [u8]) -> (u64, WeatherHashMap<'a>) {
+    pub fn decode_lines<'a>(mut data: &'a [u8]) -> WeatherHashMap<'a> {
         let mut batch = WeatherHashMap::with_capacity(10_000);
-        let mut records = 0;
         #[inline(always)]
         fn compute<'a>(batch: &mut WeatherHashMap<'a>, city: &'a [u8], temp: &'a [u8]) {
             batch
@@ -616,64 +624,84 @@ mod bench {
                 .or_insert_with(|| Weather::new(parse_number(temp)));
         }
 
-        const EMPTY: &[u8] = &[];
-        while !data.is_empty() {
-            let mut city = EMPTY;
-            if peek!(data) != b'#'
-                && let Some(p) = find_chr(data, b';')
-            {
-                city = &data[..p];
-                data = &data[p + 1..];
-            }
-            match find_chr(data, b'\n') {
-                Some(p) => {
-                    if !city.is_empty() {
-                        compute(&mut batch, city, &data[..p]);
-                        records += 1;
-                    }
+        while let Some(p) = find_comma(data)
+            && p > 0
+        {
+            let city = &data[..p];
+            data = &data[p + 1..];
+            match find_newline(data) {
+                Some(p) if p > 0 => {
+                    compute(&mut batch, city, &data[..p]);
                     data = &data[p + 1..];
                 }
-                None => break,
+                _ => break,
             }
         }
-        (records, batch)
+        batch
     }
 
-    #[inline(always)]
+    #[cfg(not(debug_assertions))]
     fn parse_number(mut temp: &[u8]) -> i64 {
         let x = match peek!(temp) {
             b'-' => {
                 temp = &temp[1..];
-                |v: i16| -v as i64
+                |v: isize| -v as i64
             }
-            _ => |v: i16| v as i64,
+            _ => |v: isize| v as i64,
+        };
+
+        if temp.len() > 4 {
+            temp = &temp[..4]
+        }
+
+        x(match temp.len() {
+            3 => {
+                let v = unsafe { temp.as_ptr().cast::<u32>().read_volatile() };
+                (((v & 0x0f) * 10) + ((v >> 16) & 0x0f)) as isize
+            }
+            4 => {
+                let v = unsafe { temp.as_ptr().cast::<u32>().read_volatile() };
+                (((v & 0x0f) * 100) + (((v >> 8) & 0x0f) * 10) + ((v >> 24) & 0x0f)) as isize
+            }
+            x => unreachable!("bad number {x}"),
+        })
+    }
+
+    #[inline(always)]
+    #[cfg(debug_assertions)]
+    fn parse_number(mut temp: &[u8]) -> i64 {
+        let x = match peek!(temp) {
+            b'-' => {
+                temp = &temp[1..];
+                |v: isize| -v as i64
+            }
+            _ => |v: isize| v as i64,
         };
 
         macro_rules! m1 {
             ($e:expr) => {
-                (10_i16 * $e)
+                (10_isize * $e)
             };
         }
         macro_rules! m2 {
             ($e:expr) => {
-                (100_i16 * $e)
+                (100_isize * $e)
             };
         }
         macro_rules! d {
             ($e:expr) => {
-                peek!($e) as i16 & 0x0f
+                peek!($e) as isize & 0x0f
             };
             ($e:expr, $i:expr) => {
-                peek!($e, $i) as i16 & 0x0f
+                peek!($e, $i) as isize & 0x0f
             };
         }
         if temp.len() > 4 {
             temp = &temp[..4]
         }
+
         x(match temp.len() {
-            //1.1 => 11
             3 => m1!(d!(temp)) + d!(temp, 2),
-            //11.1 => 111
             4 => m2!(d!(temp)) + m1!(d!(temp, 1)) + d!(temp, 3),
             x => unreachable!("bad number {x}"),
         })
@@ -698,7 +726,7 @@ mod bench {
         #[test]
         pub fn test_decode() {
             let data = "aaaaaaaa;-10.0\naaaaaaaa;26.0\ndef;2.1\n".as_bytes();
-            let (_, m) = decode_lines(data);
+            let m = decode_lines(data);
             assert_eq!(m.len(), 2);
             let r = m.get(&City::new("aaaaaaaa".as_bytes())).unwrap();
             assert_eq!(r.count, 2);
