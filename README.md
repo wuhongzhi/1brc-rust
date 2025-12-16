@@ -35,6 +35,7 @@ Options:
 Usage: rs_1brc bench [OPTIONS]
 
 Options:
-  -d, --data <DATA>  data file [default: ./data/measurements.txt]
-  -h, --help         Print help
+  -d, --data <DATA>    data file [default: ./data/measurements.txt]
+  -p, --parts <PARTS>  how many parts in file, default to number of physical cpu
+  -h, --help           Print help
 ```

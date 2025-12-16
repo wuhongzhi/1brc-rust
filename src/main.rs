@@ -1,3 +1,4 @@
+use crate::r#gen::Mmap;
 use anyhow::{Ok, Result};
 use clap::{Args, Parser};
 use core::str;
@@ -11,8 +12,6 @@ use std::{
     process::exit,
     time::SystemTime,
 };
-
-use crate::r#gen::Mmap;
 
 /// 1BRC for RUST
 #[derive(Parser)]
@@ -51,6 +50,10 @@ struct BenchArg {
     /// data file
     #[arg(short, long, default_value = "./data/measurements.txt")]
     data: String,
+
+    /// how many parts in file, default to number of physical cpu
+    #[arg(short, long)]
+    parts: Option<usize>,
 }
 
 pub fn main() -> Result<()> {
@@ -77,7 +80,7 @@ fn generate(argv: GenerateArg) -> Result<()> {
         .create(true)
         .truncate(true)
         .open(&argv.data)?;
-    let mut set = HashSet::new();
+    let mut result = HashSet::new();
     let mut len = {
         macro_rules! r {
             ($e:expr) => {
@@ -90,7 +93,7 @@ fn generate(argv: GenerateArg) -> Result<()> {
                 bar.set_message("Generate data ...");
                 bar.set_style(
                     ProgressStyle::with_template(
-                        "{msg} {wide_bar:.cyan/blue} {pos:>9}/{len:9} [{elapsed_precise}]",
+                        "{msg} {wide_bar:.green/blue} {pos:>9}/{len:9} [{elapsed_precise}]",
                     )
                     .unwrap(),
                 );
@@ -105,7 +108,7 @@ fn generate(argv: GenerateArg) -> Result<()> {
                     $e.write_all(&city)?;
                     $e.write_all(temp.as_bytes())?;
                     bar.inc(1);
-                    set.insert(city);
+                    result.insert(city);
                 }
             };
         }
@@ -127,12 +130,12 @@ fn generate(argv: GenerateArg) -> Result<()> {
         len /= 1024_f64;
         i += 1;
     }
-    len *= 100f64;
+
     eprintln!(
-        "Data size: {:.2} {} with {} cites",
-        len.round() / 100f64,
+        "Final size {:.2} {} with {} cities",
+        (len * 100f64).round() / 100f64,
         units[i],
-        set.len()
+        result.len()
     );
     Ok(())
 }
@@ -153,7 +156,7 @@ fn bench(argv: BenchArg) -> Result<()> {
         Fork::Child => {
             unsafe { libc::close(pipe_fds[0]) }; // Close read end
             let data = Mmap::open::<false>(File::open(argv.data)?)?;
-            let result = bench::reduce(&data)?;
+            let result = bench::reduce(&data, argv.parts)?;
             //format & detail report
             buf.push('{');
             for (id, (city, weather)) in result.iter().enumerate() {
@@ -163,13 +166,10 @@ fn bench(argv: BenchArg) -> Result<()> {
                 buf.push_str(&format!("{city}={weather}"));
             }
             buf.push_str("}\n");
-            buf.push_str(
-                format!(
-                    "Result in {:.3}ms with {} cities\n",
-                    clock.elapsed()?.as_millis(),
-                    result.len(),
-                )
-                .as_str(),
+            eprintln!(
+                "Result in {:.3}ms with {} cities",
+                clock.elapsed()?.as_millis(),
+                result.len(),
             );
             let mut writer = unsafe { File::from_raw_fd(pipe_fds[1]) };
             writer.write_all(buf.as_bytes())?;
@@ -372,28 +372,28 @@ mod bench {
     use core::{slice, str};
     use rapidhash::{HashMapExt, RapidHashMap};
     use std::{
-        collections::{BTreeMap, LinkedList},
+        collections::BTreeMap,
         fmt::{self, Display, Formatter},
-        hash::Hash,
-        num::NonZeroUsize,
+        hash::{Hash, Hasher},
         ops::{AddAssign, Deref},
+        ptr,
         sync::{Arc, Mutex, mpsc::channel},
         thread,
     };
 
     #[derive(Clone, Copy)]
     pub struct Weather {
-        min: i64,
-        max: i64,
+        min: i32,
+        max: i32,
         sum: i64,
-        count: usize,
+        count: u64,
     }
     impl Weather {
-        fn new(value: i64) -> Self {
+        fn new(value: i32) -> Self {
             Self {
                 min: value,
                 max: value,
-                sum: value,
+                sum: value as i64,
                 count: 1,
             }
         }
@@ -431,9 +431,17 @@ mod bench {
             unsafe { *($e).as_ptr().add($i) }
         };
     }
+    macro_rules! read_unaligned {
+        ($p:expr, $ty:ty) => {
+            unsafe { ptr::read_unaligned($p as *const $ty) }
+        };
+        ($p:expr, $i:expr, $ty:ty) => {
+            unsafe { ptr::read_unaligned($p.add($i) as *const $ty) }
+        };
+    }
 
-    // #[repr(transparent)]
-    #[derive(Eq, PartialOrd, Ord)]
+    #[repr(transparent)]
+    #[derive(Eq, PartialOrd, Ord, Clone)]
     pub struct City<'a> {
         pub name: &'a [u8],
     }
@@ -443,11 +451,12 @@ mod bench {
         }
     }
     impl<'a> Hash for City<'a> {
-        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        fn hash<H: Hasher>(&self, state: &mut H) {
             // self.name.hash(state);
-            const MAX: usize = size_of::<u128>();
-            if self.name.len() > MAX {
-                self.name[..MAX].hash(state);
+
+            let p1 = self.name.as_ptr();
+            if self.name.len() >= 16 {
+                read_unaligned!(p1, u128).hash(state);
             } else {
                 self.name.hash(state);
             }
@@ -473,43 +482,40 @@ mod bench {
     }
 
     struct Scanner<'a> {
-        data: Mutex<LinkedList<&'a [u8]>>,
-        size: usize,
+        data: &'a [u8],
+        slice: usize,
+        end: usize,
+        start: Mutex<usize>,
     }
     impl<'a> Scanner<'a> {
-        fn new(data: &'a [u8], _parts: NonZeroUsize) -> Self {
-            let mut v = vec![data];
-            // let parts = (data.len() / (1 << 20)).ilog2() as usize;
-            let parts = _parts.ilog2() as usize;
-            for i in 1..parts + 1 {
-                let mut t = Vec::with_capacity(i << 1);
-                for data in v {
-                    let len = data.len() >> 1;
-                    if len > 1024
-                        && let Some(mut p) = find_newline(&data[len..])
-                    {
-                        p += len;
-                        t.push(&data[..=p]);
-                        t.push(&data[p + 1..]);
-                    } else {
-                        t.push(data);
-                    }
-                }
-                v = t;
-            }
-            let mut l = LinkedList::new();
-            l.extend(v);
+        fn new(data: &'a [u8], parts: usize) -> Self {
+            let end = data.len();
             Self {
-                size: l.len(),
-                data: Mutex::new(l),
+                end,
+                data,
+                slice: end / parts,
+                start: Mutex::new(0),
             }
         }
         fn next(&self) -> Option<&'a [u8]> {
-            let mut lock = self.data.lock().unwrap();
-            lock.pop_front()
-        }
-        fn size(&self) -> usize {
-            self.size
+            let mut lock = self.start.lock().unwrap();
+            let start = *lock;
+            if start < self.end {
+                let end = start + self.slice;
+                let range = start..if end >= self.end {
+                    self.end
+                } else {
+                    match find_newline(&self.data[end..]) {
+                        Some(i) => end + i + 1,
+                        None => self.end,
+                    }
+                };
+                *lock = range.end;
+                // eprintln!("{:?}=>{:?}", thread::current().id(), range);
+                Some(&self.data[range])
+            } else {
+                None
+            }
         }
     }
 
@@ -519,20 +525,16 @@ mod bench {
     fn find_with_mask<const MASK: usize, const CHR: u8>(data: &[u8]) -> Option<usize> {
         let (mut i, end) = (0, data.len());
         //boost performance with swar
-        #[cfg(not(debug_assertions))]
-        unsafe {
-            const SIZE: usize = size_of::<usize>();
-            const MASK1: usize = usize::from_ne_bytes([0x01; SIZE]);
-            const MASK2: usize = usize::from_ne_bytes([0x80; SIZE]);
-            let p1 = data.as_ptr();
-            while i + SIZE < end {
-                let input = p1.add(i).cast::<usize>().read_volatile() ^ MASK;
-                let p = (input - MASK1) & !input & MASK2;
-                if p != 0 {
-                    return Some(i + (p.trailing_zeros() >> 3) as usize);
-                }
-                i += SIZE;
+        const SIZE: usize = size_of::<usize>();
+        const MASK1: usize = usize::from_ne_bytes([0x01; SIZE]);
+        const MASK2: usize = usize::from_ne_bytes([0x80; SIZE]);
+        while i + SIZE < end {
+            let input = read_unaligned!(data.as_ptr(), i, usize) ^ MASK;
+            let p = (input - MASK1) & !input & MASK2;
+            if p != 0 {
+                return Some(i + (p.trailing_zeros() >> 3) as usize);
             }
+            i += SIZE;
         }
         while i < end {
             if peek!(data, i) == CHR {
@@ -557,16 +559,15 @@ mod bench {
         find_with_mask::<MASK2, CHR2>(data)
     }
 
-    pub fn reduce(data: &[u8]) -> Result<BTreeMap<City<'_>, Weather>> {
+    pub fn reduce(data: &[u8], parts: Option<usize>) -> Result<BTreeMap<City<'_>, Weather>> {
         let (tasks, rx) = {
+            let (tx, rx) = channel::<Option<WeatherHashMap>>();
             let jobs = num_cpus::get_physical();
             let scanner = Arc::new(Scanner::new(
                 unsafe { slice::from_raw_parts(data.as_ptr(), data.len()) },
-                jobs.try_into().unwrap(),
+                parts.unwrap_or(0).max(jobs),
             ));
-            let jobs = jobs.min(scanner.size());
-            // eprintln!("Parallel {jobs} jobs reducing {} parts", scanner.size());
-            let (tx, rx) = channel::<Option<WeatherHashMap>>();
+
             let mut tasks = vec![];
             for _ in 0..jobs {
                 let sc1 = scanner.clone();
@@ -600,7 +601,7 @@ mod bench {
         }
 
         // just wait all, normal they all down here.
-        tasks.into_iter().for_each(|t| t.join().unwrap());
+        // tasks.into_iter().for_each(|t| t.join().unwrap());
 
         Ok(result)
     }
@@ -614,7 +615,7 @@ mod bench {
                 .and_modify(|w| {
                     let value = parse_number(temp);
                     w.count += 1;
-                    w.sum += value;
+                    w.sum += value as i64;
                     if value > w.max {
                         w.max = value
                     } else if value < w.min {
@@ -640,71 +641,40 @@ mod bench {
         batch
     }
 
-    #[cfg(not(debug_assertions))]
-    fn parse_number(mut temp: &[u8]) -> i64 {
+    #[inline(always)]
+    fn parse_number(mut temp: &[u8]) -> i32 {
         let x = match peek!(temp) {
             b'-' => {
                 temp = &temp[1..];
-                |v: isize| -v as i64
+                |v: u32| -(v as i32)
             }
-            _ => |v: isize| v as i64,
+            _ => |v: u32| v as i32,
         };
 
         if temp.len() > 4 {
             temp = &temp[..4]
         }
 
-        x(match temp.len() {
-            3 => {
-                let v = unsafe { temp.as_ptr().cast::<u32>().read_volatile() };
-                (((v & 0x0f) * 10) + ((v >> 16) & 0x0f)) as isize
-            }
-            4 => {
-                let v = unsafe { temp.as_ptr().cast::<u32>().read_volatile() };
-                (((v & 0x0f) * 100) + (((v >> 8) & 0x0f) * 10) + ((v >> 24) & 0x0f)) as isize
-            }
-            x => unreachable!("bad number {x}"),
-        })
-    }
-
-    #[inline(always)]
-    #[cfg(debug_assertions)]
-    fn parse_number(mut temp: &[u8]) -> i64 {
-        let x = match peek!(temp) {
-            b'-' => {
-                temp = &temp[1..];
-                |v: isize| -v as i64
-            }
-            _ => |v: isize| v as i64,
-        };
-
         macro_rules! m1 {
             ($e:expr) => {
-                (10_isize * $e)
+                // (10_u32 * $e)
+                ($e << 3) + ($e << 1)
             };
         }
         macro_rules! m2 {
             ($e:expr) => {
-                (100_isize * $e)
+                // (100_u32 * $e)
+                m1!(m1!($e))
             };
-        }
-        macro_rules! d {
-            ($e:expr) => {
-                peek!($e) as isize & 0x0f
-            };
-            ($e:expr, $i:expr) => {
-                peek!($e, $i) as isize & 0x0f
-            };
-        }
-        if temp.len() > 4 {
-            temp = &temp[..4]
         }
 
-        x(match temp.len() {
-            3 => m1!(d!(temp)) + d!(temp, 2),
-            4 => m2!(d!(temp)) + m1!(d!(temp, 1)) + d!(temp, 3),
+        //boost performance with swar
+        let v = match temp.len() {
+            3 => u32::from_be(unsafe { ptr::read_unaligned(temp.as_ptr() as *const u32) }) >> 8,
+            4 => u32::from_be(unsafe { ptr::read_unaligned(temp.as_ptr() as *const u32) }),
             x => unreachable!("bad number {x}"),
-        })
+        };
+        x(m2!((v >> 24) & 0x0F) + m1!((v >> 16) & 0x0F) + (v & 0x0F))
     }
 
     #[cfg(test)]
