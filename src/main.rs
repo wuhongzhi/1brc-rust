@@ -1,3 +1,4 @@
+#![feature(portable_simd)]
 use crate::r#gen::Mmap;
 use anyhow::{Ok, Result};
 use clap::{Args, Parser};
@@ -142,13 +143,13 @@ fn generate(argv: GenerateArg) -> Result<()> {
 
 fn bench(argv: BenchArg) -> Result<()> {
     let clock = SystemTime::now();
-    let mut buf = String::with_capacity(500_000);
 
     let mut pipe_fds = [0i32; 2];
     unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
     match fork()? {
         Fork::Parent(_child) => {
             unsafe { libc::close(pipe_fds[1]) }; // Close write end
+            let mut buf = String::with_capacity(512_000);
             let mut reader = unsafe { File::from_raw_fd(pipe_fds[0]) };
             reader.read_to_string(&mut buf)?;
             stdout().write_all(buf.as_bytes())?;
@@ -156,23 +157,9 @@ fn bench(argv: BenchArg) -> Result<()> {
         Fork::Child => {
             unsafe { libc::close(pipe_fds[0]) }; // Close read end
             let data = Mmap::open::<false>(File::open(argv.data)?)?;
-            let result = bench::reduce(&data, argv.parts)?;
-            //format & detail report
-            buf.push('{');
-            for (id, (city, weather)) in result.iter().enumerate() {
-                if id != 0 {
-                    buf.push_str(", ");
-                }
-                buf.push_str(&format!("{city}={weather}"));
-            }
-            buf.push_str("}\n");
-            eprintln!(
-                "Result in {:.3}ms with {} cities",
-                clock.elapsed()?.as_millis(),
-                result.len(),
-            );
-            let mut writer = unsafe { File::from_raw_fd(pipe_fds[1]) };
-            writer.write_all(buf.as_bytes())?;
+            bench::reduce(&data, argv.parts)?
+                .write(unsafe { File::from_raw_fd(pipe_fds[1]) })?
+                .wait(clock)?;
         }
     }
     exit(0);
@@ -374,11 +361,14 @@ mod bench {
     use std::{
         collections::BTreeMap,
         fmt::{self, Display, Formatter},
+        fs::File,
         hash::{Hash, Hasher},
+        io::Write,
         ops::{AddAssign, Deref},
-        ptr,
+        simd::{u8x8, u16x8, u32x8, u64x8},
         sync::{Arc, Mutex, mpsc::channel},
-        thread,
+        thread::{self, JoinHandle},
+        time::SystemTime,
     };
 
     #[derive(Clone, Copy)]
@@ -433,10 +423,10 @@ mod bench {
     }
     macro_rules! read_unaligned {
         ($p:expr, $ty:ty) => {
-            unsafe { ptr::read_unaligned($p as *const $ty) }
+            unsafe { std::ptr::read_unaligned($p as *const $ty) }
         };
         ($p:expr, $i:expr, $ty:ty) => {
-            unsafe { ptr::read_unaligned($p.add($i) as *const $ty) }
+            unsafe { std::ptr::read_unaligned($p.add($i) as *const $ty) }
         };
     }
 
@@ -454,17 +444,64 @@ mod bench {
         fn hash<H: Hasher>(&self, state: &mut H) {
             // self.name.hash(state);
 
-            let p1 = self.name.as_ptr();
-            if self.name.len() >= 16 {
-                read_unaligned!(p1, u128).hash(state);
+            let a = self.name;
+            if a.len() < 16 {
+                a.hash(state);
             } else {
-                self.name.hash(state);
+                read_unaligned!(a.as_ptr(), u128).hash(state);
             }
         }
     }
     impl<'a> PartialEq for City<'a> {
         fn eq(&self, other: &Self) -> bool {
-            self.name.eq(other.name)
+            #[inline(always)]
+            fn slow_compare(a: &[u8], b: &[u8]) -> bool {
+                let mut i = 0;
+                let len = a.len();
+                while i < len && peek!(a, i) == peek!(b, i) {
+                    i += 1;
+                }
+                i == len
+            }
+            #[inline(always)]
+            fn fast_compare(a: &[u8], b: &[u8]) -> bool {
+                macro_rules! cast {
+                    ($ty:ty, $e: expr) => {
+                        unsafe { slice::from_raw_parts::<$ty>(a.as_ptr().cast(), 8) }
+                    };
+                }
+                macro_rules! ne {
+                    ($smid:ty, $ty:ty, $a:expr, $b:expr) => {
+                        <$smid>::from_slice(cast!($ty, $a)) != <$smid>::from_slice(cast!($ty, $b))
+                    };
+                    ($smid1:ty, $ty1:ty, $c:expr, $smid2:ty, $ty2:ty, $a:expr, $b:expr) => {
+                        ne!($smid1, $ty1, $a, $b) || ne!($smid2, $ty2, &$a[$c..], &$b[$c..])
+                    };
+                    ($smid1:ty, $ty1:ty, $c:expr, $smid2:ty, $ty2:ty, $d:expr, $smid3:ty, $ty3:ty, $a:expr, $b:expr) => {
+                        ne!($smid1, $ty1, $c, $smid2, $ty2, $a, $b)
+                            || ne!($smid3, $ty3, &$a[$c + $d..], &$b[$c + $d..])
+                    };
+                }
+
+                if a.len() < 8 {
+                    return slow_compare(a, b);
+                }
+                match a.len() >> 3 {
+                    1 if ne!(u8x8, u8, a, b) => false,
+                    2 if ne!(u16x8, u16, a, b) => false,
+                    4 if ne!(u32x8, u32, a, b) => false,
+                    8 if ne!(u64x8, u64, a, b) => false,
+                    3 if ne!(u16x8, u16, 16, u8x8, u8, a, b) => false,
+                    5 if ne!(u32x8, u32, 32, u8x8, u8, a, b) => false,
+                    6 if ne!(u32x8, u32, 32, u16x8, u16, a, b) => false,
+                    7 if ne!(u32x8, u32, 32, u16x8, u16, 16, u8x8, u8, a, b) => false,
+                    x if x < 8 => slow_compare(&a[x << 3..], &b[x << 3..]),
+                    _ => a == b,
+                }
+            }
+
+            self.name.len() == other.name.len() && fast_compare(self.name, other.name)
+            // self.name.eq(other.name)
         }
     }
     impl<'a> Display for City<'a> {
@@ -521,45 +558,73 @@ mod bench {
 
     type WeatherHashMap<'a> = RapidHashMap<City<'a>, Weather>;
 
+    const C_CHR: u8 = b';';
+    const N_CHR: u8 = b'\n';
+    const F_SIZE: usize = size_of::<usize>();
+    const FC_MASK: usize = usize::from_ne_bytes([C_CHR; size_of::<usize>()]);
+    const FN_MASK: usize = usize::from_ne_bytes([N_CHR; size_of::<usize>()]);
+    const F1_MASK: usize = usize::from_ne_bytes([0x01; F_SIZE]);
+    const F2_MASK: usize = usize::from_ne_bytes([0x80; F_SIZE]);
+
     #[inline(always)]
-    fn find_with_mask<const MASK: usize, const CHR: u8>(data: &[u8]) -> Option<usize> {
+    fn find_with_mask<const MASK: usize, const MASK1: usize, const MASK2: usize, const CHR: u8>(
+        data: &[u8],
+    ) -> Option<usize> {
         let (mut i, end) = (0, data.len());
         //boost performance with swar
-        const SIZE: usize = size_of::<usize>();
-        const MASK1: usize = usize::from_ne_bytes([0x01; SIZE]);
-        const MASK2: usize = usize::from_ne_bytes([0x80; SIZE]);
-        while i + SIZE < end {
+        while i + F_SIZE < end {
             let input = read_unaligned!(data.as_ptr(), i, usize) ^ MASK;
             let p = (input - MASK1) & !input & MASK2;
             if p != 0 {
                 return Some(i + (p.trailing_zeros() >> 3) as usize);
             }
-            i += SIZE;
+            i += F_SIZE;
         }
-        while i < end {
-            if peek!(data, i) == CHR {
-                return Some(i);
-            }
+        while i < end && peek!(data, i) != CHR {
             i += 1;
         }
-        None
+        if i < end { Some(i) } else { None }
     }
-
-    const CHR1: u8 = b';';
-    const CHR2: u8 = b'\n';
-    const MASK1: usize = usize::from_ne_bytes([CHR1; size_of::<usize>()]);
-    const MASK2: usize = usize::from_ne_bytes([CHR2; size_of::<usize>()]);
 
     #[inline(always)]
     fn find_comma(data: &[u8]) -> Option<usize> {
-        find_with_mask::<MASK1, CHR1>(data)
+        find_with_mask::<FC_MASK, F1_MASK, F2_MASK, C_CHR>(data)
     }
     #[inline(always)]
     fn find_newline(data: &[u8]) -> Option<usize> {
-        find_with_mask::<MASK2, CHR2>(data)
+        find_with_mask::<FN_MASK, F1_MASK, F2_MASK, N_CHR>(data)
     }
 
-    pub fn reduce(data: &[u8], parts: Option<usize>) -> Result<BTreeMap<City<'_>, Weather>> {
+    pub struct Reduce<'a>(BTreeMap<City<'a>, Weather>, Vec<JoinHandle<()>>);
+    impl<'a> Reduce<'a> {
+        pub fn write(self, mut file: File) -> Result<Self> {
+            let mut buf = String::with_capacity(512_000);
+            buf.push('{');
+            for (id, (city, weather)) in self.0.iter().enumerate() {
+                if id != 0 {
+                    buf.push_str(", ");
+                }
+                buf.push_str(&format!("{city}={weather}"));
+            }
+            buf.push_str("}\n");
+            file.write_all(buf.as_bytes())?;
+            Ok(self)
+        }
+        pub fn wait(self, clock: SystemTime) -> Result<()> {
+            eprintln!(
+                "Result in {:.3}ms with {} cities",
+                clock.elapsed()?.as_millis(),
+                self.0.len(),
+            );
+            // just wait all, normal they all down here.
+            for t in self.1.into_iter() {
+                t.join().unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    pub fn reduce(data: &[u8], parts: Option<usize>) -> Result<Reduce<'_>> {
         let (tasks, rx) = {
             let (tx, rx) = channel::<Option<WeatherHashMap>>();
             let jobs = num_cpus::get_physical();
@@ -600,10 +665,7 @@ mod bench {
             }
         }
 
-        // just wait all, normal they all down here.
-        // tasks.into_iter().for_each(|t| t.join().unwrap());
-
-        Ok(result)
+        Ok(Reduce(result, tasks))
     }
 
     pub fn decode_lines<'a>(mut data: &'a [u8]) -> WeatherHashMap<'a> {
@@ -642,39 +704,30 @@ mod bench {
     }
 
     #[inline(always)]
-    fn parse_number(mut temp: &[u8]) -> i32 {
-        let x = match peek!(temp) {
-            b'-' => {
-                temp = &temp[1..];
-                |v: u32| -(v as i32)
+    fn parse_number(temp: &[u8]) -> i32 {
+        #[inline(always)]
+        fn bdc2bin(ptr: *const u8) -> i32 {
+            macro_rules! m1 {
+                ($e:expr) => {
+                    ($e << 3) + ($e << 1)
+                };
             }
-            _ => |v: u32| v as i32,
-        };
-
-        if temp.len() > 4 {
-            temp = &temp[..4]
+            macro_rules! m2 {
+                ($e:expr) => {
+                    m1!(m1!($e))
+                };
+            }
+            let mut v = u32::from_be(read_unaligned!(ptr, u32));
+            if (v & 0x0F) > 9 {
+                v >>= 8;
+            }
+            //boost performance with swar
+            (m2!((v >> 24) & 0x0F) + m1!((v >> 16) & 0x0F) + (v & 0x0F)) as i32
         }
-
-        macro_rules! m1 {
-            ($e:expr) => {
-                // (10_u32 * $e)
-                ($e << 3) + ($e << 1)
-            };
+        match peek!(temp) {
+            b'-' => -bdc2bin(unsafe { temp.as_ptr().add(1) }),
+            _ => bdc2bin(temp.as_ptr()),
         }
-        macro_rules! m2 {
-            ($e:expr) => {
-                // (100_u32 * $e)
-                m1!(m1!($e))
-            };
-        }
-
-        //boost performance with swar
-        let v = match temp.len() {
-            3 => u32::from_be(unsafe { ptr::read_unaligned(temp.as_ptr() as *const u32) }) >> 8,
-            4 => u32::from_be(unsafe { ptr::read_unaligned(temp.as_ptr() as *const u32) }),
-            x => unreachable!("bad number {x}"),
-        };
-        x(m2!((v >> 24) & 0x0F) + m1!((v >> 16) & 0x0F) + (v & 0x0F))
     }
 
     #[cfg(test)]
@@ -683,26 +736,73 @@ mod bench {
 
         #[test]
         pub fn test_parse_number() {
-            let val = parse_number("10.9".as_bytes());
+            let val = parse_number("10.9\n".as_bytes());
             assert_eq!(val, 109);
-            let val = parse_number("-10.9".as_bytes());
+            let val = parse_number("-10.9\n".as_bytes());
             assert_eq!(val, -109);
-            let val = parse_number("1.0".as_bytes());
+            let val = parse_number("1.0\n".as_bytes());
             assert_eq!(val, 10);
-            let val = parse_number("-1.0".as_bytes());
+            let val = parse_number("-1.0\n".as_bytes());
             assert_eq!(val, -10);
         }
 
         #[test]
         pub fn test_decode() {
-            let data = "aaaaaaaa;-10.0\naaaaaaaa;26.0\ndef;2.1\n".as_bytes();
+            let data = "aaaaaaaaa;-10.0\naaaaaaaaa;26.0\ndef;2.1\n".as_bytes();
             let m = decode_lines(data);
             assert_eq!(m.len(), 2);
-            let r = m.get(&City::new("aaaaaaaa".as_bytes())).unwrap();
+            let r = m.get(&City::new("aaaaaaaaa".as_bytes())).unwrap();
             assert_eq!(r.count, 2);
             assert_eq!(r.min, -100);
             assert_eq!(r.max, 260);
             assert_eq!(r.sum, 160);
+        }
+
+        #[test]
+        pub fn test_swar() {
+            fn fmt(mut v: String) -> String {
+                let mut i = v.len() - 8;
+                while i > 0 {
+                    v.insert(i, ' ');
+                    i -= 8;
+                }
+                v
+            }
+            macro_rules! e {
+                ($b: expr, $e:expr) => {
+                    $b.push_str(&format!(
+                        "{:>32} {}",
+                        stringify!($e),
+                        fmt(format!("{:032b}", $e))
+                    ))
+                };
+                ($b: expr, $e:expr,) => {
+                    $b.push_str(&format!("{:>32} {}", stringify!($e), $e));
+                };
+            }
+            //boost performance with swar
+            const SIZE: usize = size_of::<u32>();
+            const MASK: u32 = u32::from_ne_bytes([b';'; SIZE]);
+            const MASK1: u32 = u32::from_ne_bytes([0x01; SIZE]);
+            const MASK2: u32 = u32::from_ne_bytes([0x80; SIZE]);
+            let mut input = u32::from_ne_bytes([b'a', b'b', b';', b'c']);
+
+            let mut buf = String::new();
+            e!(buf, MASK);
+            e!(buf, MASK1);
+            e!(buf, MASK2);
+            e!(buf, input);
+            e!(buf, input ^ MASK);
+            input ^= MASK;
+            e!(buf, (input - MASK1));
+            e!(buf, (input - MASK1) & !input);
+            e!(buf, (input - MASK1) & !input & MASK2);
+            let p = (input - MASK1) & !input & MASK2;
+            e!(buf, p.trailing_zeros(),);
+            e!(buf, p.trailing_zeros() >> 3,);
+
+            eprintln!("{}", buf.as_str());
+            assert_eq!(p.trailing_zeros() >> 3, 2);
         }
     }
 }
