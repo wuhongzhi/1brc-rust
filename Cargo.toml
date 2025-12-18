@@ -1,6 +1,6 @@
 [package]
 name = "rs_1brc"
-version = "0.1.6"
+version = "0.1.8"
 edition = "2024"
 description = "The One Billion Row Challenge for RUST"
 license = "MIT"

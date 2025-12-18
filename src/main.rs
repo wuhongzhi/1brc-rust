@@ -1,6 +1,6 @@
 #![feature(portable_simd)]
 use crate::r#gen::Mmap;
-use anyhow::{Ok, Result};
+use anyhow::Result;
 use clap::{Args, Parser};
 use core::str;
 use fork::{Fork, fork};
@@ -27,7 +27,7 @@ enum Cli {
 #[derive(Args)]
 struct GenerateArg {
     /// Record size
-    #[arg(short, long, default_value_t = 100_000_000)]
+    #[arg(short, long, default_value_t = 1_000_000_000)]
     size: u64,
 
     /// cities used for data file
@@ -73,6 +73,7 @@ fn generate(argv: GenerateArg) -> Result<()> {
     };
     let cities: Vec<bench::City<'_>> = bench::decode_lines(data)
         .into_keys()
+        .filter(|x| !x.name.is_empty() && x.name[0] != b'#')
         .take(argv.cities)
         .collect();
     let file = OpenOptions::new()
@@ -156,10 +157,16 @@ fn bench(argv: BenchArg) -> Result<()> {
         }
         Fork::Child => {
             unsafe { libc::close(pipe_fds[0]) }; // Close read end
-            let data = Mmap::open::<false>(File::open(argv.data)?)?;
-            bench::reduce(&data, argv.parts)?
-                .write(unsafe { File::from_raw_fd(pipe_fds[1]) })?
-                .wait(clock)?;
+            match Mmap::open::<false>(File::open(argv.data)?) {
+                Ok(data) => {
+                    bench::reduce(&data, argv.parts)?
+                        .write(unsafe { File::from_raw_fd(pipe_fds[1]) })?
+                        .wait(clock)?;
+                }
+                Err(e) => {
+                    eprintln!("{e:?}");
+                }
+            }
         }
     }
     exit(0);
@@ -258,6 +265,9 @@ mod r#gen {
                     inner: RawData::default(),
                 })
             } else {
+                if length == 0 {
+                    bail!("Empty file");
+                }
                 let mut chunk = usize::MAX;
                 if chunk as u64 > length {
                     chunk = length as usize
@@ -421,6 +431,7 @@ mod bench {
             unsafe { *($e).as_ptr().add($i) }
         };
     }
+
     macro_rules! read_unaligned {
         ($p:expr, $ty:ty) => {
             unsafe { std::ptr::read_unaligned($p as *const $ty) }
@@ -443,7 +454,6 @@ mod bench {
     impl<'a> Hash for City<'a> {
         fn hash<H: Hasher>(&self, state: &mut H) {
             // self.name.hash(state);
-
             let a = self.name;
             if a.len() < 16 {
                 a.hash(state);
@@ -454,8 +464,9 @@ mod bench {
     }
     impl<'a> PartialEq for City<'a> {
         fn eq(&self, other: &Self) -> bool {
+            // self.name.eq(other.name)
             #[inline(always)]
-            fn slow_compare(a: &[u8], b: &[u8]) -> bool {
+            fn slow_loop(a: &[u8], b: &[u8]) -> bool {
                 let mut i = 0;
                 let len = a.len();
                 while i < len && peek!(a, i) == peek!(b, i) {
@@ -464,44 +475,80 @@ mod bench {
                 i == len
             }
             #[inline(always)]
-            fn fast_compare(a: &[u8], b: &[u8]) -> bool {
-                macro_rules! cast {
+            fn fast_simd(a: &[u8], b: &[u8]) -> bool {
+                macro_rules! cast_x8 {
                     ($ty:ty, $e: expr) => {
                         unsafe { slice::from_raw_parts::<$ty>(a.as_ptr().cast(), 8) }
                     };
                 }
-                macro_rules! ne {
+                macro_rules! simd_ne {
                     ($smid:ty, $ty:ty, $a:expr, $b:expr) => {
-                        <$smid>::from_slice(cast!($ty, $a)) != <$smid>::from_slice(cast!($ty, $b))
+                        <$smid>::from_slice(cast_x8!($ty, $a))
+                            != <$smid>::from_slice(cast_x8!($ty, $b))
                     };
                     ($smid1:ty, $ty1:ty, $c:expr, $smid2:ty, $ty2:ty, $a:expr, $b:expr) => {
-                        ne!($smid1, $ty1, $a, $b) || ne!($smid2, $ty2, &$a[$c..], &$b[$c..])
+                        simd_ne!($smid1, $ty1, $a, $b)
+                            || simd_ne!($smid2, $ty2, &$a[$c..], &$b[$c..])
                     };
                     ($smid1:ty, $ty1:ty, $c:expr, $smid2:ty, $ty2:ty, $d:expr, $smid3:ty, $ty3:ty, $a:expr, $b:expr) => {
-                        ne!($smid1, $ty1, $c, $smid2, $ty2, $a, $b)
-                            || ne!($smid3, $ty3, &$a[$c + $d..], &$b[$c + $d..])
+                        simd_ne!($smid1, $ty1, $c, $smid2, $ty2, $a, $b)
+                            || simd_ne!($smid3, $ty3, &$a[$c + $d..], &$b[$c + $d..])
                     };
                 }
-
-                if a.len() < 8 {
-                    return slow_compare(a, b);
-                }
                 match a.len() >> 3 {
-                    1 if ne!(u8x8, u8, a, b) => false,
-                    2 if ne!(u16x8, u16, a, b) => false,
-                    4 if ne!(u32x8, u32, a, b) => false,
-                    8 if ne!(u64x8, u64, a, b) => false,
-                    3 if ne!(u16x8, u16, 16, u8x8, u8, a, b) => false,
-                    5 if ne!(u32x8, u32, 32, u8x8, u8, a, b) => false,
-                    6 if ne!(u32x8, u32, 32, u16x8, u16, a, b) => false,
-                    7 if ne!(u32x8, u32, 32, u16x8, u16, 16, u8x8, u8, a, b) => false,
-                    x if x < 8 => slow_compare(&a[x << 3..], &b[x << 3..]),
+                    1 if simd_ne!(u8x8, u8, a, b) => false,
+                    2 if simd_ne!(u16x8, u16, a, b) => false,
+                    3 if simd_ne!(u16x8, u16, 16, u8x8, u8, a, b) => false,
+                    4 if simd_ne!(u32x8, u32, a, b) => false,
+                    5 if simd_ne!(u32x8, u32, 32, u8x8, u8, a, b) => false,
+                    6 if simd_ne!(u32x8, u32, 32, u16x8, u16, a, b) => false,
+                    7 if simd_ne!(u32x8, u32, 32, u16x8, u16, 16, u8x8, u8, a, b) => false,
+                    8 if simd_ne!(u64x8, u64, a, b) => false,
+                    x if x < 8 => slow_loop(&a[x << 3..], &b[x << 3..]),
                     _ => a == b,
                 }
             }
 
-            self.name.len() == other.name.len() && fast_compare(self.name, other.name)
-            // self.name.eq(other.name)
+            #[inline(always)]
+            //fast detect first & last 2bytes base on the city statistics
+            fn fast_detect(a: &[u8], b: &[u8]) -> bool {
+                let len = a.len();
+                if peek!(a) != peek!(b)
+                    || read_unaligned!(a.as_ptr(), len - 2, u16)
+                        != read_unaligned!(b.as_ptr(), len - 2, u16)
+                {
+                    return false;
+                }
+
+                true
+            }
+
+            #[inline(always)]
+            fn fast_length(a: usize, b: usize) -> bool {
+                a != b
+            }
+
+            let mut a = self.name;
+            let mut b = other.name;
+            let mut len = a.len();
+            if fast_length(len, b.len()) {
+                return false;
+            }
+            if len >= 3 {
+                match fast_detect(a, b) {
+                    false => return false,
+                    true if len == 3 => return true,
+                    true => {
+                        len -= 3;
+                        a = &a[1..=len];
+                        b = &b[1..=len];
+                    }
+                }
+            }
+            if len < 8 {
+                return slow_loop(a, b);
+            }
+            fast_simd(a, b)
         }
     }
     impl<'a> Display for City<'a> {
@@ -574,9 +621,9 @@ mod bench {
         //boost performance with swar
         while i + F_SIZE < end {
             let input = read_unaligned!(data.as_ptr(), i, usize) ^ MASK;
-            let p = (input - MASK1) & !input & MASK2;
-            if p != 0 {
-                return Some(i + (p.trailing_zeros() >> 3) as usize);
+            let position = (input - MASK1) & !input & MASK2;
+            if position != 0 {
+                return Some(i + (position.trailing_zeros() >> 3) as usize);
             }
             i += F_SIZE;
         }
@@ -639,9 +686,7 @@ mod bench {
                 let tx1 = tx.clone();
                 tasks.push(thread::spawn(move || {
                     while let Some(part) = sc1.next() {
-                        if !part.is_empty() {
-                            tx1.send(Some(decode_lines(part))).unwrap();
-                        }
+                        tx1.send(Some(decode_lines(part))).unwrap();
                     }
                     tx1.send(None).unwrap();
                 }));
@@ -687,15 +732,15 @@ mod bench {
                 .or_insert_with(|| Weather::new(parse_number(temp)));
         }
 
-        while let Some(p) = find_comma(data)
-            && p > 0
+        while let Some(comma) = find_comma(data)
+            && comma > 0
         {
-            let city = &data[..p];
-            data = &data[p + 1..];
+            let city = &data[..comma];
+            data = &data[comma + 1..];
             match find_newline(data) {
-                Some(p) if p > 0 => {
-                    compute(&mut batch, city, &data[..p]);
-                    data = &data[p + 1..];
+                Some(newline) if newline > 0 => {
+                    compute(&mut batch, city, &data[..newline]);
+                    data = &data[newline + 1..];
                 }
                 _ => break,
             }
@@ -704,29 +749,28 @@ mod bench {
     }
 
     #[inline(always)]
-    fn parse_number(temp: &[u8]) -> i32 {
+    fn parse_number(bcd: &[u8]) -> i32 {
         #[inline(always)]
-        fn bdc2bin(ptr: *const u8) -> i32 {
+        fn bdc2bin(bcd: &[u8]) -> i32 {
             macro_rules! m1 {
                 ($e:expr) => {
-                    ($e << 3) + ($e << 1)
+                    $e * 10
                 };
             }
             macro_rules! m2 {
                 ($e:expr) => {
-                    m1!(m1!($e))
+                    $e * 100
                 };
             }
-            let mut v = u32::from_be(read_unaligned!(ptr, u32));
-            if (v & 0x0F) > 9 {
-                v >>= 8;
-            }
             //boost performance with swar
-            (m2!((v >> 24) & 0x0F) + m1!((v >> 16) & 0x0F) + (v & 0x0F)) as i32
+            let v = (u32::from_be(read_unaligned!(bcd.as_ptr(), u32)) & 0x0F0F0F0F)
+                >> ((4 - bcd.len()) << 3);
+            (m2!(v >> 24) + m1!((v << 8) >> 24) + ((v << 24) >> 24)) as i32
         }
-        match peek!(temp) {
-            b'-' => -bdc2bin(unsafe { temp.as_ptr().add(1) }),
-            _ => bdc2bin(temp.as_ptr()),
+
+        match peek!(bcd) {
+            b'-' => -bdc2bin(&bcd[1..]),
+            _ => bdc2bin(bcd),
         }
     }
 
@@ -736,13 +780,13 @@ mod bench {
 
         #[test]
         pub fn test_parse_number() {
-            let val = parse_number("10.9\n".as_bytes());
+            let val = parse_number("10.9".as_bytes());
             assert_eq!(val, 109);
-            let val = parse_number("-10.9\n".as_bytes());
+            let val = parse_number("-10.9".as_bytes());
             assert_eq!(val, -109);
-            let val = parse_number("1.0\n".as_bytes());
+            let val = parse_number("1.0".as_bytes());
             assert_eq!(val, 10);
-            let val = parse_number("-1.0\n".as_bytes());
+            let val = parse_number("-1.0".as_bytes());
             assert_eq!(val, -10);
         }
 
@@ -769,15 +813,16 @@ mod bench {
                 v
             }
             macro_rules! e {
-                ($b: expr, $e:expr) => {
+                ($b: expr, $e:expr, $x: expr) => {
                     $b.push_str(&format!(
-                        "{:>32} {}",
+                        "{:>32} | {} | {}\n",
                         stringify!($e),
-                        fmt(format!("{:032b}", $e))
+                        fmt(format!("{:032b}", $e)),
+                        $x
                     ))
                 };
-                ($b: expr, $e:expr,) => {
-                    $b.push_str(&format!("{:>32} {}", stringify!($e), $e));
+                ($b: expr, $e:expr) => {
+                    $b.push_str(&format!("{:>32} | {}\n", stringify!($e), $e));
                 };
             }
             //boost performance with swar
@@ -785,24 +830,27 @@ mod bench {
             const MASK: u32 = u32::from_ne_bytes([b';'; SIZE]);
             const MASK1: u32 = u32::from_ne_bytes([0x01; SIZE]);
             const MASK2: u32 = u32::from_ne_bytes([0x80; SIZE]);
-            let mut input = u32::from_ne_bytes([b'a', b'b', b';', b'c']);
-
+            let mut arr = [b'1'; SIZE];
+            arr[SIZE - 2] = b';';
+            let mut input = u32::from_ne_bytes(arr);
             let mut buf = String::new();
-            e!(buf, MASK);
-            e!(buf, MASK1);
-            e!(buf, MASK2);
-            e!(buf, input);
-            e!(buf, input ^ MASK);
-            input ^= MASK;
-            e!(buf, (input - MASK1));
-            e!(buf, (input - MASK1) & !input);
-            e!(buf, (input - MASK1) & !input & MASK2);
-            let p = (input - MASK1) & !input & MASK2;
-            e!(buf, p.trailing_zeros(),);
-            e!(buf, p.trailing_zeros() >> 3,);
 
-            eprintln!("{}", buf.as_str());
-            assert_eq!(p.trailing_zeros() >> 3, 2);
+            e!(buf, input, "");
+            e!(buf, MASK, "");
+            e!(buf, input ^ MASK, "=>input");
+            input ^= MASK;
+            e!(buf, MASK1, "");
+            e!(buf, (input - MASK1), "");
+            e!(buf, !input, "");
+            e!(buf, (input - MASK1) & !input, "");
+            e!(buf, MASK2, "");
+            e!(buf, (input - MASK1) & !input & MASK2, "");
+            let p = (input - MASK1) & !input & MASK2;
+            e!(buf, p.trailing_zeros());
+            e!(buf, p.trailing_zeros() >> 3);
+            assert_eq!(p.trailing_zeros() >> 3, (SIZE - 2) as u32);
+
+            eprintln!("\n\n{}\n", buf.as_str());
         }
     }
 }

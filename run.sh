@@ -13,5 +13,5 @@ elif [ "$1" == 'b' ]; then
         bc | sort | head -n4 | tail -n3 | \
         awk '{count+=$1} END{print count/NR}'
 else
-    cargo run --release -- bench $@
+    time cargo run --release -- bench $@
 fi
