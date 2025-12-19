@@ -7,6 +7,7 @@ elif [ "$1" == 'd' ]; then
     cargo run --release -- gen $@
 elif [ "$1" == 'b' ]; then
     shift
+    export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so.3
     for s in {1..5}; do
        time ./target/release/rs_1brc bench $@ > /dev/null
     done |& grep real | sed -e 's/real//' -e 's/s$//' -e 's/m/\*60+/' | \

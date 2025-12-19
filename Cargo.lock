@@ -220,6 +220,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f84267b20a16ea918e43c6a88433c2d54fa145c92a811b5b047ccbe153674483"
 
 [[package]]
+name = "proc-cpuinfo"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf5e67580a7a844bd6db5fa32e0a6061c03e3aabe186233ed11b516605db6d69"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -248,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "rs_1brc"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -256,6 +262,7 @@ dependencies = [
  "indicatif",
  "libc",
  "num_cpus",
+ "proc-cpuinfo",
  "rapidhash",
 ]
 
