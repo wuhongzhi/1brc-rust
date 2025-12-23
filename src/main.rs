@@ -1,4 +1,5 @@
 #![feature(portable_simd)]
+#![feature(test)]
 use crate::r#gen::Mmap;
 use anyhow::Result;
 use clap::{Args, Parser};
@@ -52,9 +53,13 @@ struct BenchArg {
     #[arg(short, long, default_value = "./data/measurements.txt")]
     data: String,
 
-    /// slice size, default to file size / cpu cores
+    /// slice size, default to file size / workers
     #[arg(short, long)]
     slice: Option<usize>,
+
+    /// parallel workers, default to cpu cores
+    #[arg(short, long)]
+    workers: Option<usize>,
 }
 
 pub fn main() -> Result<()> {
@@ -66,26 +71,34 @@ pub fn main() -> Result<()> {
 }
 fn generate(argv: GenerateArg) -> Result<()> {
     let mut data = String::new();
-    let data = {
+    let mut data = {
         let mut file = File::open(argv.template)?;
         file.read_to_string(&mut data)?;
         data.as_bytes()
     };
-    let mut cities = bench::WeatherHashMap::default();
-    bench::decode_lines(data, &mut cities);
-    let cities: Vec<bench::City<'_>> = cities
-        .into_keys()
-        .filter(|x| !x.name.is_empty() && x.name[0] != b'#')
-        .take(argv.cities)
-        .collect();
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&argv.data)?;
-    let mut result = HashSet::new();
+    let mut cities: Vec<(bench::City<'_>, bool)> = {
+        let mut cities = HashSet::new();
+        while let Some(newline) = bench::find_newline(data) {
+            if data[0] != b'#'
+                && let Some(comma) = bench::find_comma(&data[..newline])
+            {
+                cities.insert(bench::City::new(&data[..comma]));
+            }
+            data = &data[newline + 1..];
+        }
+        cities
+            .into_iter()
+            .take(argv.cities)
+            .map(|city| (city, false))
+            .collect()
+    };
     let mut len = {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&argv.data)?;
         macro_rules! r {
             ($e:expr) => {
                 unsafe { libc::rand() } as usize % $e
@@ -101,18 +114,19 @@ fn generate(argv: GenerateArg) -> Result<()> {
                     )
                     .unwrap(),
                 );
+                let len = cities.len();
                 for _ in 0..argv.size {
-                    let city = &cities[r!(cities.len())];
+                    let city = &mut cities[r!(len)];
                     let temp = format!(
                         ";{}{}.{}\n",
                         if r!(100) < 50 { "-" } else { "" },
                         r!(100),
                         r!(10),
                     );
-                    $e.write_all(&city)?;
+                    $e.write_all(&city.0)?;
                     $e.write_all(temp.as_bytes())?;
                     bar.inc(1);
-                    result.insert(city);
+                    city.1 = true
                 }
             };
         }
@@ -139,7 +153,7 @@ fn generate(argv: GenerateArg) -> Result<()> {
         "Final size {:.2} {} with {} cities",
         (len * 100f64).round() / 100f64,
         units[i],
-        result.len()
+        cities.iter().filter(|f| f.1).count()
     );
     Ok(())
 }
@@ -162,7 +176,7 @@ fn bench(argv: BenchArg) -> Result<()> {
         }
         Fork::Child => match Mmap::open::<false>(File::open(argv.data)?) {
             Ok(data) => {
-                bench::reduce(&data, argv.slice)?
+                bench::reduce(&data, argv.slice, argv.workers)?
                     .write(unsafe { File::from_raw_fd(pipe_fds[1]) })?
                     .wait(clock)?;
             }
@@ -386,13 +400,13 @@ mod bench {
 
     #[derive(Clone, Copy)]
     pub struct Weather {
-        min: i32,
-        max: i32,
+        min: i16,
+        max: i16,
         sum: i64,
-        count: u64,
+        count: u32,
     }
     impl Weather {
-        fn new(value: i32) -> Self {
+        fn new(value: i16) -> Self {
             Self {
                 min: value,
                 max: value,
@@ -618,11 +632,11 @@ mod bench {
     }
 
     #[inline(always)]
-    fn find_comma(data: &[u8]) -> Option<usize> {
+    pub fn find_comma(data: &[u8]) -> Option<usize> {
         find_with_mask::<FC_MASK, F1_MASK, F2_MASK, C_CHR>(data)
     }
     #[inline(always)]
-    fn find_newline(data: &[u8]) -> Option<usize> {
+    pub fn find_newline(data: &[u8]) -> Option<usize> {
         find_with_mask::<FN_MASK, F1_MASK, F2_MASK, N_CHR>(data)
     }
 
@@ -655,12 +669,15 @@ mod bench {
         }
     }
 
-    pub fn reduce(data: &[u8], slice: Option<usize>) -> Result<Reduce<'_>> {
+    pub fn reduce(data: &[u8], slice: Option<usize>, workers: Option<usize>) -> Result<Reduce<'_>> {
         let (tasks, rx) = {
             let (cpu_cores, cache_size) = {
                 let proc = CpuInfo::read()?;
                 match proc.cpus().last() {
-                    Some(cpu) => (cpu.cpu_cores().unwrap(), cpu.cache_size().unwrap()),
+                    Some(cpu) => (
+                        workers.unwrap_or(cpu.cpu_cores().unwrap()).max(1),
+                        cpu.cache_size().unwrap(),
+                    ),
                     None => (1, 1 << 20),
                 }
             };
@@ -674,7 +691,7 @@ mod bench {
                 let sc1 = scanner.clone();
                 let tx1 = tx.clone();
                 tasks.push(thread::spawn(move || {
-                    let mut cities = WeatherHashMap::with_capacity(10_000);
+                    let mut cities = WeatherHashMap::new();
                     while let Some(part) = sc1.next() {
                         decode_lines(part, &mut cities);
                     }
@@ -724,9 +741,9 @@ mod bench {
     }
 
     #[inline(always)]
-    fn parse_number(value: &[u8]) -> i32 {
+    fn parse_number(value: &[u8]) -> i16 {
         #[inline(always)]
-        fn bdc2bin(value: &[u8]) -> i32 {
+        fn bdc2bin(value: &[u8]) -> i16 {
             macro_rules! m1 {
                 ($e:expr) => {
                     $e * 10
@@ -740,7 +757,7 @@ mod bench {
             //boost performance with swar
             let v = (u32::from_be(read_unaligned!(value.as_ptr(), u32)) & 0x0F0F0F0F)
                 >> ((4 - value.len()) << 3);
-            (m2!(v >> 24) + m1!((v << 8) >> 24) + ((v << 24) >> 24)) as i32
+            (m2!(v >> 24) + m1!((v << 8) >> 24) + ((v << 24) >> 24)) as i16
         }
 
         match read_byte!(value) {
@@ -753,6 +770,7 @@ mod bench {
     pub mod tests {
         use super::{City, decode_lines, parse_number};
         use crate::bench::WeatherHashMap;
+        extern crate test;
 
         #[test]
         pub fn test_parse_number() {
@@ -828,6 +846,15 @@ mod bench {
             assert_eq!(p.trailing_zeros() >> 3, (SIZE - 2) as u32);
 
             eprintln!("\n\n{}\n", buf.as_str());
+        }
+
+        #[bench]
+        fn bench_decode(b: &mut test::Bencher) {
+            let data = "aaaaaaaaa;-10.0\naaaaaaaaa;26.0\ndef;2.1\n".as_bytes();
+            b.iter(|| {
+                let mut m = WeatherHashMap::default();
+                decode_lines(data, &mut m);
+            });
         }
     }
 }

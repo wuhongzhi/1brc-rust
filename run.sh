@@ -1,7 +1,8 @@
 #!/bin/bash
 cd $(dirname $0)
 if [ "$1" == "g" ]; then
-    cargo flamegraph --release -- bench > /dev/null
+    shift
+    cargo flamegraph --release -- bench $@> /dev/null
 elif [ "$1" == 'd' ]; then    
     shift
     cargo run --release -- gen $@

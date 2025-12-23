@@ -1,6 +1,6 @@
 [package]
 name = "rs_1brc"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 description = "The One Billion Row Challenge for RUST"
 license = "MIT"
@@ -11,9 +11,8 @@ clap = { version = "4.5.53", features = ["derive"] }
 fork = "0.6.0"
 indicatif = "0.18.3"
 libc = "0.2.178"
-num_cpus = "1.17.0"
 proc-cpuinfo = "0.2.0"
-rapidhash = "4.1.1"
+rapidhash = "4.2.0"
 
 [profile.release]
 panic = "abort"
