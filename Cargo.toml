@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.53", features = ["derive"] }
+concat-idents = "1.1.5"
 fork = "0.6.0"
 indicatif = "0.18.3"
 libc = "0.2.178"
