@@ -21,11 +21,11 @@ Options:
 Usage: rs_1brc gen [OPTIONS]
 
 Options:
-  -s, --size <SIZE>          Record size [default: 1000000]
-  -c, --cities <CITIES>      cities used for data file [default: 10000]
+  -s, --size <SIZE>          Record size [default: 1000000000]
+  -c, --cities <CITIES>      cities used for data file, max 10,000 cities [default: 8000]
   -t, --template <TEMPLATE>  template file [default: ./data/weather_stations.csv]
   -d, --data <DATA>          data file [default: ./data/measurements.txt]
-  -l, --legency              write data line by line
+  -l, --legacy               write data line by line
   -h, --help                 Print help
 ```
 
@@ -35,7 +35,9 @@ Options:
 Usage: rs_1brc bench [OPTIONS]
 
 Options:
-  -d, --data <DATA>    data file [default: ./data/measurements.txt]
-  -p, --parts <PARTS>  how many parts in file, default to number of physical cpu
-  -h, --help           Print help
+  -d, --data <DATA>        data file [default: ./data/measurements.txt]
+  -s, --slice <SLICE>      slice size, default to file size / workers
+  -w, --workers <WORKERS>  parallel workers, default to cpu cores
+      --dry-run            dry-run without map/reduce
+  -h, --help               Print help
 ```

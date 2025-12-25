@@ -1,6 +1,6 @@
 #![feature(portable_simd)]
 #![feature(test)]
-use crate::r#gen::Mmap;
+use crate::{bench::ThousandSep, r#gen::Mmap};
 use anyhow::Result;
 use clap::{Args, Parser};
 use core::str;
@@ -13,8 +13,41 @@ use std::{
     mem::ManuallyDrop,
     os::fd::FromRawFd,
     process::exit,
+    slice,
     time::SystemTime,
 };
+
+macro_rules! pre_slice {
+    ($d:expr, $i:expr) => {
+        unsafe { slice::from_raw_parts($d.as_ptr(), $i) }
+    };
+}
+macro_rules! pst_slice {
+    ($d:expr, $i:expr) => {
+        unsafe {
+            let off = $i;
+            let len = $d.len() - off;
+            slice::from_raw_parts($d.as_ptr().add(off), len)
+        }
+    };
+}
+macro_rules! mid_slice {
+    ($d:expr, $i:expr) => {
+        unsafe {
+            let r = $i;
+            slice::from_raw_parts($d.as_ptr().add(r.start), r.end - r.start)
+        }
+    };
+}
+macro_rules! read_byte {
+    ($e:expr) => {
+        unsafe { *$e }
+    };
+    ($e:expr, $i:expr) => {
+        unsafe { *$e.add($i) }
+    };
+}
+const RESULT_BITS: u32 = 17;
 
 /// 1BRC for RUST
 #[derive(Parser)]
@@ -32,8 +65,8 @@ struct GenerateArg {
     #[arg(short, long, default_value_t = 1_000_000_000)]
     size: u64,
 
-    /// cities used for data file
-    #[arg(short, long, default_value_t = 10_000)]
+    /// cities used for data file, max 10,000 cities
+    #[arg(short, long, default_value_t = 8_000, value_parser = max_cities)]
     cities: usize,
 
     /// template file
@@ -46,7 +79,10 @@ struct GenerateArg {
 
     /// write data line by line
     #[arg(short, long)]
-    legency: bool,
+    legacy: bool,
+}
+fn max_cities(s: &str) -> Result<usize> {
+    Ok(s.parse::<usize>()?.clamp(1, 10_000))
 }
 #[derive(Args)]
 struct BenchArg {
@@ -61,6 +97,10 @@ struct BenchArg {
     /// parallel workers, default to cpu cores
     #[arg(short, long)]
     workers: Option<usize>,
+
+    /// dry-run without map/reduce
+    #[arg(long)]
+    dry_run: bool,
 }
 
 pub fn main() -> Result<()> {
@@ -80,12 +120,12 @@ fn generate(argv: GenerateArg) -> Result<()> {
     let mut cities: Vec<(bench::City<'_>, bool)> = {
         let mut cities = HashSet::new();
         while let Some(newline) = bench::find_newline(data) {
-            if data[0] != b'#'
-                && let Some(comma) = bench::find_comma(&data[..newline])
+            if read_byte!(data.as_ptr()) != b'#'
+                && let Some(comma) = bench::find_comma(pre_slice!(data, newline))
             {
-                cities.insert(bench::City::new(&data[..comma]));
+                cities.insert(bench::City::new(pre_slice!(data, comma)));
             }
-            data = &data[newline + 1..];
+            data = pst_slice!(data, newline + 1);
         }
         cities
             .into_iter()
@@ -100,7 +140,7 @@ fn generate(argv: GenerateArg) -> Result<()> {
             .create(true)
             .truncate(true)
             .open(&argv.data)?;
-        macro_rules! r {
+        macro_rules! rand {
             ($e:expr) => {
                 unsafe { libc::rand() } as usize % $e
             };
@@ -117,12 +157,11 @@ fn generate(argv: GenerateArg) -> Result<()> {
                 );
                 let len = cities.len();
                 for _ in 0..argv.size {
-                    let city = &mut cities[r!(len)];
+                    let city = &mut cities[rand!(len)];
                     let temp = format!(
-                        ";{}{}.{}\n",
-                        if r!(100) < 50 { "-" } else { "" },
-                        r!(100),
-                        r!(10),
+                        ";{}{:.1}\n",
+                        if rand!(100) < 50 { "-" } else { "" },
+                        rand!(1000) as f32 / 10f32,
                     );
                     $e.write_all(&city.0)?;
                     $e.write_all(temp.as_bytes())?;
@@ -131,7 +170,7 @@ fn generate(argv: GenerateArg) -> Result<()> {
                 }
             };
         }
-        if argv.legency {
+        if argv.legacy {
             let mut file = BufWriter::new(file);
             lines!(file);
             file.flush()?;
@@ -151,10 +190,10 @@ fn generate(argv: GenerateArg) -> Result<()> {
     }
 
     eprintln!(
-        "Final size {:.2} {} with {} cities",
-        (len * 100f64).round() / 100f64,
+        "Final size {} {} with {} cities",
+        ((len * 100f64).round() / 100f64).format(3),
         units[i],
-        cities.iter().filter(|f| f.1).count()
+        cities.iter().filter(|f| f.1).count().format(0)
     );
     Ok(())
 }
@@ -176,7 +215,7 @@ fn bench(argv: BenchArg) -> Result<()> {
         }
         Fork::Child => match Mmap::open::<false>(File::open(argv.data)?) {
             Ok(data) => {
-                bench::reduce(&data, argv.slice, argv.workers)?
+                bench::reduce(&data, argv.slice, argv.workers, argv.dry_run)?
                     .write(unsafe { File::from_raw_fd(pipe_fds[1]) }, new_buf())?
                     .wait(clock)?;
             }
@@ -199,6 +238,7 @@ mod r#gen {
         mem::ManuallyDrop,
         ops::Deref,
         os::fd::AsRawFd,
+        slice,
     };
 
     trait Remaining {
@@ -370,8 +410,8 @@ mod r#gen {
                     self.inner.write(bytes)?;
                     break;
                 } else if remain > 0 {
-                    self.inner.write(&bytes[..remain])?;
-                    bytes = &bytes[remain..];
+                    self.inner.write(pre_slice!(bytes, remain))?;
+                    bytes = pst_slice!(bytes, remain);
                 }
                 self.next_map()?;
             }
@@ -384,12 +424,16 @@ mod r#gen {
     }
 }
 mod bench {
-    use anyhow::Result;
+    use anyhow::{Ok, Result};
     use core::{slice, str};
     use proc_cpuinfo::CpuInfo;
-    use rapidhash::{HashMapExt, RapidHashMap};
+    use rapidhash::fast::RandomState;
+    use rayon::prelude::*;
+    use std::env::args;
+    use std::hash::BuildHasher;
+    use std::iter::FusedIterator;
+    use std::{cmp, thread};
     use std::{
-        cmp,
         collections::BTreeMap,
         fmt::{self, Display, Formatter},
         fs::File,
@@ -398,10 +442,10 @@ mod bench {
         mem::ManuallyDrop,
         ops::{AddAssign, Deref},
         simd::{u8x8, u16x8, u32x8, u64x8},
-        sync::{Arc, Mutex, mpsc::channel},
-        thread::{self, JoinHandle},
         time::SystemTime,
     };
+
+    use crate::RESULT_BITS;
 
     #[derive(Clone, Copy)]
     pub struct Weather {
@@ -433,7 +477,6 @@ mod bench {
             self.min = cmp::min(self.min, rhs.min);
         }
     }
-
     impl Display for Weather {
         fn fmt(&self, f: &mut Formatter) -> fmt::Result {
             write!(
@@ -445,15 +488,6 @@ mod bench {
             )
         }
     }
-
-    macro_rules! read_byte {
-        ($e:expr) => {
-            unsafe { *$e }
-        };
-        ($e:expr, $i:expr) => {
-            unsafe { *$e.add($i) }
-        };
-    }
     macro_rules! read_unaligned {
         ($p:expr, $ty:ty) => {
             unsafe { std::ptr::read_unaligned($p as *const $ty) }
@@ -462,29 +496,6 @@ mod bench {
             unsafe { std::ptr::read_unaligned(($p as *const $ty).add($i)) }
         };
     }
-    macro_rules! pre_slice {
-        ($d:expr, $i:expr) => {
-            unsafe { slice::from_raw_parts($d.as_ptr(), $i) }
-        };
-    }
-    macro_rules! pst_slice {
-        ($d:expr, $i:expr) => {
-            unsafe {
-                let off = $i;
-                let len = $d.len() - off;
-                slice::from_raw_parts($d.as_ptr().add(off), len)
-            }
-        };
-    }
-    macro_rules! mid_slice {
-        ($d:expr, $i:expr) => {
-            unsafe {
-                let r = $i;
-                slice::from_raw_parts($d.as_ptr().add(r.start), r.end - r.start)
-            }
-        };
-    }
-
     #[repr(transparent)]
     #[derive(Clone, Copy, PartialOrd, Ord, Eq)]
     pub struct City<'a> {
@@ -499,10 +510,12 @@ mod bench {
         fn hash<H: Hasher>(&self, state: &mut H) {
             // self.name.hash(state);
             let a = self.name;
-            if a.len() < 16 {
-                a.hash(state);
-            } else {
-                read_unaligned!(a.as_ptr(), u128).hash(state);
+            match a.len() >> 4 {
+                0 => a.hash(state),
+                _ => {
+                    read_unaligned!(a.as_ptr(), u64).hash(state);
+                    read_unaligned!(a.as_ptr().add(a.len() - size_of::<u64>()), u64).hash(state);
+                }
             }
         }
     }
@@ -558,7 +571,7 @@ mod bench {
                     6 if simd_ne!(32, 16, a, b) => false,
                     7 if simd_ne!(32, 16, 8, a, b) => false,
                     8 if simd_ne!(64, a, b) => false,
-                    x if x < 8 => slow_loop(pst_slice!(a, x << 3), pst_slice!(b, x << 3)),
+                    x @ 0..=8 => slow_loop(pst_slice!(a, x << 3), pst_slice!(b, x << 3)),
                     _ => a == b,
                 }
             }
@@ -595,7 +608,6 @@ mod bench {
             f.write_str(unsafe { str::from_utf8_unchecked(self.name) })
         }
     }
-
     impl<'a> Deref for City<'a> {
         type Target = [u8];
 
@@ -603,10 +615,45 @@ mod bench {
             self.name
         }
     }
+    pub trait ThousandSep {
+        fn format(&self, decimal: usize) -> String;
+    }
+    impl<T: Display> ThousandSep for T {
+        fn format(&self, decimal: usize) -> String {
+            let str = self.to_string();
+            let mut v = str.split(".");
+            let mut r = String::new();
+            if let Some(mut v) = v.next() {
+                let len = v.len() % 3;
+                if len > 0 {
+                    r.push_str(&v[..len]);
+                    v = &v[len..];
+                }
+                while v.len() >= 3 {
+                    if !r.is_empty() {
+                        r.push(',');
+                    }
+                    r.push_str(&v[..3]);
+                    v = &v[3..];
+                }
+            }
+            if decimal > 0
+                && let Some(v) = v.next()
+            {
+                r.push('.');
+                let len = decimal.min(v.len());
+                r.push_str(&v[..len]);
+                for _ in len..decimal {
+                    r.push('0');
+                }
+            }
+            r
+        }
+    }
 
     struct Scanner<'a> {
         data: &'a [u8],
-        off: Mutex<usize>,
+        off: usize,
         slice: usize,
     }
     impl<'a> Scanner<'a> {
@@ -614,13 +661,15 @@ mod bench {
             Self {
                 data,
                 slice,
-                off: Mutex::new(0),
+                off: 0,
             }
         }
-        fn next(&self) -> Option<&'a [u8]> {
-            let mut lock = self.off.lock().unwrap();
+    }
+    impl<'a> Iterator for Scanner<'a> {
+        type Item = &'a [u8];
+        fn next(&mut self) -> Option<Self::Item> {
             let self_end = self.data.len();
-            let off = *lock;
+            let off = self.off;
             if off < self_end {
                 let end = off + self.slice;
                 let range = off..if end < self_end {
@@ -631,7 +680,7 @@ mod bench {
                 } else {
                     self_end
                 };
-                *lock = range.end;
+                self.off = range.end;
                 Some(mid_slice!(self.data, range))
             } else {
                 None
@@ -639,7 +688,121 @@ mod bench {
         }
     }
 
-    pub type WeatherMap<'a> = RapidHashMap<City<'a>, Weather>;
+    pub type WeatherMap<'a> = MyWeatherMap<'a>;
+
+    #[derive(Clone, Copy)]
+    enum MyWeatherNode<'a> {
+        Value((City<'a>, Weather)),
+        Empty,
+    }
+
+    pub struct MyWeatherMap<'a> {
+        inner: Vec<MyWeatherNode<'a>>,
+        hasher: RandomState,
+    }
+
+    const BITS_MASK: usize = (1 << RESULT_BITS) - 1;
+
+    impl<'a> Default for MyWeatherMap<'a> {
+        fn default() -> Self {
+            MyWeatherMap {
+                inner: vec![MyWeatherNode::Empty; 1 << RESULT_BITS],
+                hasher: RandomState::default(),
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    impl<'a> MyWeatherMap<'a> {
+        pub fn reset(&mut self) -> &mut Self {
+            for node in self.inner.iter_mut() {
+                if matches!(node, MyWeatherNode::Value(_)) {
+                    *node = MyWeatherNode::Empty;
+                }
+            }
+            self
+        }
+        pub fn len(&self) -> usize {
+            let mut r = 0;
+            for i in self.inner.iter() {
+                if let MyWeatherNode::Value(_) = i {
+                    r += 1;
+                }
+            }
+            r
+        }
+        pub fn get(&self, city: &City<'static>) -> Option<&Weather> {
+            for i in self.inner.iter() {
+                if let MyWeatherNode::Value(v) = i
+                    && v.0.eq(city)
+                {
+                    return Some(&v.1);
+                }
+            }
+            None
+        }
+        pub fn iter(self) -> WeatherIter<'a> {
+            WeatherIter {
+                pos: 0,
+                inner: self.inner,
+            }
+        }
+
+        // TODO: refine this method
+        #[inline(always)]
+        pub fn put<const MASK: usize>(&mut self, key: City<'a>, value: i16) -> usize {
+            let index = self.hasher.hash_one(key);
+            let mut index = ((index.rotate_right(RESULT_BITS * 4)
+                ^ (index >> (RESULT_BITS * 3))
+                ^ (index >> (RESULT_BITS * 2))
+                ^ (index >> RESULT_BITS)
+                ^ index)
+                & MASK as u64) as usize;
+            let mut miss: usize = 0;
+            loop {
+                match unsafe { self.inner.get_unchecked_mut(index) } {
+                    MyWeatherNode::Value((city, weather)) => {
+                        if !key.eq(city) {
+                            index = (index + 97) & MASK;
+                            miss += 1;
+                            assert!(miss <= BITS_MASK, "Map is full!");
+                            continue;
+                        }
+                        weather.count += 1;
+                        weather.sum += value as i64;
+                        match value {
+                            x if x > weather.max => weather.max = x,
+                            x if x < weather.min => weather.min = x,
+                            _ => {}
+                        }
+                    }
+                    node => {
+                        *node = MyWeatherNode::Value((key, Weather::new(value)));
+                    }
+                }
+                break miss;
+            }
+        }
+    }
+    pub struct WeatherIter<'a> {
+        pos: usize,
+        inner: Vec<MyWeatherNode<'a>>,
+    }
+    impl<'a> FusedIterator for WeatherIter<'a> {}
+    impl<'a> Iterator for WeatherIter<'a> {
+        type Item = (City<'a>, Weather);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            while self.pos < self.inner.len() {
+                if let MyWeatherNode::Value(x) = unsafe { self.inner.get_unchecked_mut(self.pos) } {
+                    self.pos += 1;
+                    return Some(*x);
+                }
+                self.pos += 1;
+            }
+            None
+        }
+    }
 
     macro_rules! find_with_const {
         ($ty:ty, $chr: expr) => {
@@ -684,11 +847,13 @@ mod bench {
         find_with_mask(data)
     }
 
-    pub struct Reduce<'a>(BTreeMap<City<'a>, Weather>, Vec<JoinHandle<()>>);
+    #[repr(transparent)]
+    pub struct Reduce<'a>((BTreeMap<City<'a>, Weather>, usize));
+
     impl<'a> Reduce<'a> {
         pub fn write(self, mut file: File, mut buf: ManuallyDrop<Vec<u8>>) -> Result<Self> {
             buf.push(b'{');
-            for (id, (city, weather)) in self.0.iter().enumerate() {
+            for (id, (city, weather)) in self.0.0.iter().enumerate() {
                 if id != 0 {
                     buf.extend_from_slice(", ".as_bytes());
                 }
@@ -699,92 +864,116 @@ mod bench {
             Ok(self)
         }
         pub fn wait(self, clock: SystemTime) -> Result<()> {
+            let taken = clock.elapsed()?;
             eprintln!(
-                "Result in {:.3}ms with {} cities",
-                clock.elapsed()?.as_millis(),
-                self.0.len(),
+                "Result in {}ms with {} lines and {} cities, on average of {:.3}ns/line",
+                (taken.as_micros() as f64 / 1_000f64).format(3),
+                self.0.1.format(0),
+                self.0.0.len().format(0),
+                taken.as_nanos() as f64 / self.0.1 as f64
             );
-            // normally, they are already done.
-            for t in self.1.into_iter() {
-                t.join().unwrap();
-            }
             Ok(())
         }
     }
 
-    pub fn reduce(data: &[u8], slice: Option<usize>, workers: Option<usize>) -> Result<Reduce<'_>> {
-        let (tasks, rx) = {
-            let (cpu_cores, cache_size) = {
-                let proc = CpuInfo::read()?;
-                match proc.cpus().last() {
-                    Some(cpu) => (
-                        workers.unwrap_or(cpu.cpu_cores().unwrap()).max(1),
-                        cpu.cache_size().unwrap(),
-                    ),
-                    None => (1, 1 << 20),
-                }
-            };
-            let scanner = Arc::new(Scanner::new(
-                unsafe { slice::from_raw_parts(data.as_ptr(), data.len()) },
-                slice
-                    .unwrap_or(data.len() / cpu_cores)
-                    .max(cache_size / cpu_cores),
-            ));
-            let (tx, rx) = channel::<WeatherMap>();
-            let mut tasks = vec![];
-            for j in 0..cpu_cores {
-                let sc1 = scanner.clone();
-                let tx1 = tx.clone();
-                tasks.push(
-                    thread::Builder::new()
-                        .name(format!("decode-task-{j}"))
-                        .spawn(move || {
-                            let mut cities = WeatherMap::new();
-                            while let Some(part) = sc1.next() {
-                                decode_lines(part, &mut cities);
-                            }
-                            tx1.send(cities).unwrap();
-                        })?,
+    pub fn reduce(
+        data: &[u8],
+        slice: Option<usize>,
+        workers: Option<usize>,
+        dry_run: bool,
+    ) -> Result<Reduce<'_>> {
+        fn map<'a>(dry_run: bool) -> impl Fn(&'a [u8]) -> (BTreeMap<City<'a>, Weather>, usize) {
+            move |part| {
+                let clock = SystemTime::now();
+                let mut cities = WeatherMap::default();
+                let total = decode_lines(part, &mut cities, dry_run);
+                eprintln!(
+                    "{:?} -> decode {} lines within {}ms",
+                    thread::current().id(),
+                    total.format(0),
+                    (clock.elapsed().unwrap().as_micros() as f64 / 1_000f64).format(3)
                 );
+                let mut result: BTreeMap<City<'_>, Weather> = BTreeMap::default();
+                result.extend(cities.iter());
+                (result, total)
             }
-            (tasks, rx)
-        };
-
-        let mut result = BTreeMap::new();
-        for _ in 0..tasks.len() {
-            let cities = rx.recv()?;
-            for (city, value) in cities {
+        }
+        fn reduce<'a>(
+            mut result: (BTreeMap<City<'a>, Weather>, usize),
+            cities: (BTreeMap<City<'a>, Weather>, usize),
+        ) -> (BTreeMap<City<'a>, Weather>, usize) {
+            for (city, value) in cities.0.into_iter() {
                 result
+                    .0
                     .entry(city)
                     .and_modify(|weather| *weather += value)
                     .or_insert(value);
             }
+            result.1 += cities.1;
+            result
         }
 
-        Ok(Reduce(result, tasks))
+        let (cpu_cores, cache_size) = {
+            let proc = CpuInfo::read()?;
+            match proc.cpus().last() {
+                Some(cpu) => (
+                    workers.unwrap_or(cpu.cpu_cores().unwrap()).max(1),
+                    cpu.cache_size().unwrap(),
+                ),
+                None => (1, 1 << 20),
+            }
+        };
+        let scanner = Scanner::new(
+            unsafe { slice::from_raw_parts(data.as_ptr(), data.len()) },
+            slice
+                .unwrap_or(data.len() / cpu_cores)
+                .max(cache_size / cpu_cores),
+        );
+        Ok(Reduce(
+            match cpu_cores {
+                1 => scanner.map(map(dry_run)).reduce(reduce),
+                _ => {
+                    rayon::ThreadPoolBuilder::new()
+                        .thread_name(|i| format!("decode-worker-{i}"))
+                        .num_threads(cpu_cores)
+                        .build_global()?;
+                    scanner
+                        .par_bridge()
+                        .into_par_iter()
+                        .map(map(dry_run))
+                        .reduce_with(reduce)
+                }
+            }
+            .unwrap(),
+        ))
     }
 
-    pub fn decode_lines<'a>(mut data: &'a [u8], cities: &mut WeatherMap<'a>) {
+    pub fn decode_lines<'a>(
+        mut data: &'a [u8],
+        cities: &mut WeatherMap<'a>,
+        dry_run: bool,
+    ) -> usize {
+        let mut miss = 0;
+        let mut total: usize = 0;
         while let Some(comma) = find_comma(data) {
             let city = City::new(pre_slice!(data, comma));
             data = pst_slice!(data, comma + 1);
             if let Some(newline) = find_newline(data) {
                 let value = parse_number(pre_slice!(data, newline));
                 data = pst_slice!(data, newline + 1);
-                cities
-                    .entry(city)
-                    .and_modify(|weather| {
-                        weather.count += 1;
-                        weather.sum += value as i64;
-                        match value {
-                            x if x > weather.max => weather.max = x,
-                            x if x < weather.min => weather.min = x,
-                            _ => {}
-                        }
-                    })
-                    .or_insert_with(|| value.into());
+                if !dry_run {
+                    miss += cities.put::<BITS_MASK>(city, value);
+                }
+                total += 1;
             }
         }
+        if !args().any(|a| a == "--bench") {
+            eprintln!(
+                "Miss Ratio -> {}%",
+                (miss as f64 * 1_00f64 / total as f64).format(3)
+            );
+        }
+        total
     }
 
     #[inline(always)]
@@ -834,7 +1023,7 @@ mod bench {
         pub fn test_decode() {
             let data = "aaaaaaaaa;-10.0\naaaaaaaaa;26.0\ndef;2.1\n".as_bytes();
             let mut m = WeatherMap::default();
-            decode_lines(data, &mut m);
+            decode_lines(data, &mut m, false);
             assert_eq!(m.len(), 2);
             let r = m.get(&City::new("aaaaaaaaa".as_bytes())).unwrap();
             assert_eq!(r.count, 2);
@@ -895,12 +1084,11 @@ mod bench {
         }
 
         #[bench]
-        fn bench_decode(b: &mut test::Bencher) {
+        fn bench_reduce(b: &mut test::Bencher) {
             let data = "aaaaaaaaa;-10.0\naaaaaaaaa;26.0\ndef;2.1\n".as_bytes();
             let mut m = WeatherMap::default();
             b.iter(|| {
-                m.clear();
-                decode_lines(data, &mut m);
+                decode_lines(data, m.reset(), false);
             });
         }
     }
