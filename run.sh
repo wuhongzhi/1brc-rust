@@ -1,4 +1,5 @@
 #!/bin/bash
+export RUSTFLAGS="-Ctarget-cpu=native -Ctarget-feature=+avx,+avx2,-fma"
 cd $(dirname $0)
 if [ "$1" == "g" ]; then
     shift
