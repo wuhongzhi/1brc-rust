@@ -799,72 +799,41 @@ mod bench {
             None
         }
     }
-    macro_rules! set {
-        ($v:expr, $i:expr, $r:expr) => {
-            unsafe { *$v.get_unchecked_mut($i) = $r };
-        };
-    }
     macro_rules! get {
         ($v:expr, $i:expr) => {
             unsafe { *$v.get_unchecked($i) }
         };
     }
-    macro_rules! find_mask {
-        ($chr:expr, $data:expr, $positions:expr, $leading:expr, $ty:ty, $simd:ty) => {{
-            const U_SIZE: usize = size_of::<$ty>();
-            const F_SIZE: usize = size_of::<$simd>();
-            const MASK: $simd = <$simd>::splat(<$ty>::from_ne_bytes([$chr; U_SIZE]));
-            const MASK1: $simd = <$simd>::splat(<$ty>::from_ne_bytes([0x01; U_SIZE]));
-            const MASK2: $simd = <$simd>::splat(<$ty>::from_ne_bytes([0x80; U_SIZE]));
-            $data = pst_slice!($data, $leading);
-            let (mut count, mut next, end) = (0, 0, $data.len());
-            // boost performance with simd
-            for _ in 0..(end / F_SIZE) {
-                let value = read_unaligned!($data.as_ptr().add(next), $simd) ^ MASK;
-                let value = ((value - MASK1) & !value & MASK2).to_array();
-                for j in 0..value.len() {
-                    let off = $leading + next + j * U_SIZE;
-                    let mut x = get!(value, j);
-                    while x != 0 {
-                        let v = x.trailing_zeros() >> 3;
-                        set!($positions, count, off + v as usize);
-                        x ^= 1 << ((v << 3) + 7) as u32;
-                        count += 1;
-                    }
-                }
-                match count {
-                    x if x > 0 => return Some(count),
-                    _ => next += F_SIZE,
-                }
-            }
-            for j in next..end {
-                if read_byte!($data.as_ptr(), j) == $chr {
-                    set!($positions, 0, $leading + j);
-                    return Some(1);
-                }
-            }
-            None
-        }};
-    }
     const CHR_NL: u8 = b'\n';
     const CHR_CM: u8 = b';';
     #[inline(always)]
-    #[allow(unused_unsafe)]
-    pub fn find_comma_simd(
-        mut data: &[u8],
-        positions: &mut [usize],
-        leading: usize,
-    ) -> Option<usize> {
-        find_mask!(CHR_CM, data, positions, leading, u64, u64x4)
-    }
-    #[inline(always)]
-    #[allow(unused_unsafe)]
-    pub fn find_newline_simd(
-        mut data: &[u8],
-        positions: &mut [usize],
-        leading: usize,
-    ) -> Option<usize> {
-        find_mask!(CHR_NL, data, positions, leading, u64, u64x4)
+    pub fn find_comma_simd(data: &[u8]) -> Option<usize> {
+        const U_SIZE: usize = size_of::<u64>();
+        const F_SIZE: usize = size_of::<u64x4>();
+        const MASK: u64x4 = u64x4::splat(u64::from_ne_bytes([CHR_CM; U_SIZE]));
+        const MASK1: u64x4 = u64x4::splat(u64::from_ne_bytes([0x01; U_SIZE]));
+        const MASK2: u64x4 = u64x4::splat(u64::from_ne_bytes([0x80; U_SIZE]));
+        let (mut off, end) = (0, data.len());
+        // boost performance with simd
+        for _ in 0..(end / F_SIZE) {
+            let value = read_unaligned!(data.as_ptr().add(off), u64x4) ^ MASK;
+            let value = ((value - MASK1) & !value & MASK2).to_array();
+            for j in 0..value.len() {
+                match get!(value, j) {
+                    x if x != 0 => {
+                        return Some(off + j * U_SIZE + (x.trailing_zeros() >> 3) as usize);
+                    }
+                    _ => {}
+                }
+            }
+            off += F_SIZE
+        }
+        for j in off..end {
+            if read_byte!(data.as_ptr(), j) == CHR_CM {
+                return Some(j);
+            }
+        }
+        None
     }
     #[inline(always)]
     pub fn find_newline(data: &[u8]) -> Option<usize> {
@@ -1001,7 +970,6 @@ mod bench {
         ))
     }
 
-    #[allow(unused_unsafe)]
     pub fn decode_lines<'a>(
         mut data: &'a [u8],
         result: &mut WeatherMap<'a>,
@@ -1009,26 +977,21 @@ mod bench {
         debug: bool,
     ) -> usize {
         let mut miss = 0;
-        let mut total = 0;
-        let mut commas = [0; 64];
-        let mut newlns = [0; 64];
-        while let Some(c1) = find_comma_simd(data, &mut commas, 0)
-            && let Some(c2) = find_newline_simd(data, &mut newlns, get!(commas, 0) + 1)
-        {
-            let mut next = 0;
-            let batch = if c1 <= c2 { c1 } else { c2 };
-            (0..batch).for_each(|i| {
-                let comma = get!(commas, i);
-                let newline = get!(newlns, i);
-                let city = mid_slice!(data, next..comma);
-                let value = mid_slice!(data, (comma + 1)..newline);
-                next = newline + 1;
-                if !dry_run {
-                    miss += result.put::<BITS_MASK>(city.into(), parse_number(value));
+        let mut total: usize = 0;
+        while let Some(comma) = find_comma_simd(data) {
+            let city = pre_slice!(data, comma);
+            data = pst_slice!(data, comma + 1);
+            match find_newline(data) {
+                Some(newline) => {
+                    let value = pre_slice!(data, newline);
+                    data = pst_slice!(data, newline + 1);
+                    if !dry_run {
+                        miss += result.put::<BITS_MASK>(city.into(), parse_number(value));
+                    }
+                    total += 1;
                 }
-            });
-            data = pst_slice!(data, next);
-            total += batch;
+                None => break,
+            }
         }
         if debug && !args().any(|a| a == "--bench") {
             eprintln!(

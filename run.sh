@@ -1,5 +1,5 @@
 #!/bin/bash
-export RUSTFLAGS="-Ctarget-cpu=native -Ctarget-feature=+avx,+avx2,-fma"
+export RUSTFLAGS="-Ctarget-cpu=native"
 cd $(dirname $0)
 if [ "$1" == "g" ]; then
     shift
@@ -15,6 +15,9 @@ elif [ "$1" == 'b' ]; then
     done |& grep real | sed -e 's/real//' -e 's/s$//' -e 's/m/\*60+/' | \
         bc | sort | head -n4 | tail -n3 | \
         awk '{count+=$1} END{print count/NR}'
+elif [ "$1" == 'p' ]; then
+    shift
+    perf stat ./target/release/rs_1brc bench $@ > /dev/null
 else
     time cargo run --release -- bench $@
 fi
