@@ -34,7 +34,7 @@ macro_rules! mid_slice {
     ($d:expr, $i:expr) => {
         unsafe {
             let r = $i;
-            slice::from_raw_parts($d.as_ptr().add(r.start), r.end - r.start)
+            slice::from_raw_parts($d.as_ptr().add(r.start), r.len())
         }
     };
 }
@@ -46,7 +46,7 @@ macro_rules! read_byte {
         unsafe { *$e.add($i) }
     };
 }
-const RESULT_BITS: u32 = 17;
+const RESULT_BITS: u32 = 16;
 
 /// 1BRC for RUST
 #[derive(Parser)]
@@ -435,7 +435,6 @@ mod bench {
     use rapidhash::fast::RandomState;
     use rayon::prelude::*;
     use std::{
-        cmp,
         collections::BTreeMap,
         env::args,
         fmt::{self, Display, Formatter},
@@ -446,7 +445,7 @@ mod bench {
         mem::ManuallyDrop,
         ops::{AddAssign, Deref},
         ptr,
-        simd::{u8x8, u16x8, u32x8, u64x4, u64x8},
+        simd::{u8x8, u16x8, u32x8, u64x8},
         thread,
         time::SystemTime,
     };
@@ -474,21 +473,29 @@ mod bench {
         }
     }
     impl AddAssign for Weather {
-        fn add_assign(&mut self, rhs: Self) {
-            self.sum += rhs.sum;
-            self.count += rhs.count;
-            self.max = cmp::max(self.max, rhs.max);
-            self.min = cmp::min(self.min, rhs.min);
+        fn add_assign(&mut self, other: Self) {
+            self.sum += other.sum;
+            self.count += other.count;
+            if self.max < other.max {
+                self.max = other.max;
+            }
+            if self.min < other.min {
+                self.min = other.min;
+            }
         }
     }
     impl Display for Weather {
         fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+            let mut avg = (self.sum as f64 / self.count as f64).round() / 10f64;
+            if avg.abs() < 0.01 {
+                avg = 0f64;
+            }
             write!(
                 f,
-                "{:.1}/{:.1}/{:.1}",
-                self.min as f64 / 10f64,
-                (self.sum as f64 / self.count as f64).round() / 10f64,
-                self.max as f64 / 10f64,
+                "{}/{}/{}",
+                (self.min as f64 / 10f64).format(1),
+                avg,
+                (self.max as f64 / 10f64).format(1),
             )
         }
     }
@@ -759,7 +766,7 @@ mod bench {
                 match unsafe { self.inner.get_unchecked_mut(index) } {
                     MyWeatherNode::Value((city, weather)) => {
                         if !key.eq(city) {
-                            index = (index + 97) & MASK;
+                            index = (index + 1319) & MASK;
                             miss += 1;
                             assert!(miss <= BITS_MASK, "Map is full!");
                             continue;
@@ -822,15 +829,21 @@ mod bench {
             for _ in 0..(end / F_SIZE) {
                 let value = read_unaligned!($data.as_ptr().add(next), $simd) ^ MASK;
                 let value = ((value - MASK1) & !value & MASK2).to_array();
+                let mut off = $leading + next;
                 for j in 0..value.len() {
-                    let off = $leading + next + j * U_SIZE;
-                    let mut x = get!(value, j);
-                    while x != 0 {
-                        let v = x.trailing_zeros() >> 3;
-                        set!($positions, count, off + v as usize);
-                        x ^= 1 << ((v << 3) + 7) as u32;
-                        count += 1;
+                    match get!(value, j) {
+                        0 => {}
+                        mut x => loop {
+                            let v = x.trailing_zeros() >> 3;
+                            set!($positions, count, off + v as usize);
+                            x ^= 1 << ((v << 3) + 7) as u32;
+                            count += 1;
+                            if x == 0 {
+                                break;
+                            }
+                        },
                     }
+                    off += U_SIZE;
                 }
                 match count {
                     x if x > 0 => return Some(count),
@@ -848,24 +861,22 @@ mod bench {
     }
     const CHR_NL: u8 = b'\n';
     const CHR_CM: u8 = b';';
-    #[inline(always)]
-    #[allow(unused_unsafe)]
-    pub fn find_comma_simd(
-        mut data: &[u8],
-        positions: &mut [usize],
-        leading: usize,
-    ) -> Option<usize> {
-        find_mask!(CHR_CM, data, positions, leading, u64, u64x4)
+    macro_rules! define_find {
+        ($name:ident, $chr: ident) => {
+            #[inline(always)]
+            #[allow(unused_unsafe)]
+            pub fn $name(
+                mut data: &[u8],
+                positions: &mut [usize],
+                leading: usize,
+            ) -> Option<usize> {
+                find_mask!($chr, data, positions, leading, u64, std::simd::u64x4)
+            }
+        };
     }
-    #[inline(always)]
-    #[allow(unused_unsafe)]
-    pub fn find_newline_simd(
-        mut data: &[u8],
-        positions: &mut [usize],
-        leading: usize,
-    ) -> Option<usize> {
-        find_mask!(CHR_NL, data, positions, leading, u64, u64x4)
-    }
+    define_find!(find_comma_simd, CHR_CM);
+    define_find!(find_newline_simd, CHR_NL);
+
     #[inline(always)]
     pub fn find_newline(data: &[u8]) -> Option<usize> {
         const F_SIZE: usize = size_of::<u64>();
@@ -970,7 +981,7 @@ mod bench {
             let proc = CpuInfo::read()?;
             match proc.cpus().last() {
                 Some(cpu) => (
-                    workers.unwrap_or(cpu.cpu_cores().unwrap()).max(1),
+                    workers.unwrap_or(cpu.processor().unwrap_or(0) + 1).max(1),
                     cpu.cache_size().unwrap(),
                 ),
                 None => (1, 1 << 20),
@@ -1010,30 +1021,56 @@ mod bench {
     ) -> usize {
         let mut miss = 0;
         let mut total = 0;
+        let mut batch = 0;
         let mut commas = [0; 64];
         let mut newlns = [0; 64];
         while let Some(c1) = find_comma_simd(data, &mut commas, 0)
             && let Some(c2) = find_newline_simd(data, &mut newlns, get!(commas, 0) + 1)
         {
             let mut next = 0;
-            let batch = if c1 <= c2 { c1 } else { c2 };
-            (0..batch).for_each(|i| {
-                let comma = get!(commas, i);
-                let newline = get!(newlns, i);
-                let city = mid_slice!(data, next..comma);
-                let value = mid_slice!(data, (comma + 1)..newline);
-                next = newline + 1;
-                if !dry_run {
-                    miss += result.put::<BITS_MASK>(city.into(), parse_number(value));
+            macro_rules! pipeline {
+                ($i: expr) => {
+                    let comma = get!(commas, $i);
+                    let city = mid_slice!(data, next..comma);
+                    let newline = get!(newlns, $i);
+                    let value = mid_slice!(data, (comma + 1)..newline);
+                    next = newline + 1;
+                    if !dry_run {
+                        miss += result.put::<BITS_MASK>(city.into(), parse_number(value));
+                    }
+                };
+            }
+            match c2.min(c1) {
+                2 => {
+                    pipeline!(0);
+                    pipeline!(1);
+                    total += 2;
                 }
-            });
+                1 => {
+                    pipeline!(0);
+                    total += 1;
+                }
+                3 => {
+                    pipeline!(0);
+                    pipeline!(1);
+                    pipeline!(2);
+                    total += 3;
+                }
+                x => {
+                    (0..x).for_each(|i| {
+                        pipeline!(i);
+                    });
+                    total += x;
+                }
+            }
             data = pst_slice!(data, next);
-            total += batch;
+            batch += 1;
         }
         if debug && !args().any(|a| a == "--bench") {
             eprintln!(
-                "Miss Ratio -> {}%",
-                (miss as f64 * 1_00f64 / total as f64).format(3)
+                "Miss Ratio {}%, {} L/B",
+                (miss as f64 * 1_00f64 / total as f64).format(3),
+                (total as f64 / batch as f64).format(3)
             );
         }
         total
