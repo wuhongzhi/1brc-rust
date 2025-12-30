@@ -12,6 +12,7 @@ elif [ "$1" == 'b' ]; then
     export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so.3
     for s in {1..5}; do
        time ./target/release/rs_1brc bench $@ > /dev/null
+       sleep 1
     done |& grep real | sed -e 's/real//' -e 's/s$//' -e 's/m/\*60+/' | \
         bc | sort | head -n4 | tail -n3 | \
         awk '{count+=$1} END{print count/NR}'

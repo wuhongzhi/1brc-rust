@@ -455,7 +455,7 @@ mod bench {
         min: i16,
         max: i16,
         sum: i64,
-        count: u32,
+        count: u64,
     }
     impl Weather {
         fn new(value: i16) -> Self {
@@ -476,12 +476,8 @@ mod bench {
         fn add_assign(&mut self, other: Self) {
             self.sum += other.sum;
             self.count += other.count;
-            if self.max < other.max {
-                self.max = other.max;
-            }
-            if self.min < other.min {
-                self.min = other.min;
-            }
+            self.max = self.max.max(other.max);
+            self.min = self.min.min(other.min);
         }
     }
     impl Display for Weather {
@@ -552,9 +548,9 @@ mod bench {
                 }
                 macro_rules! simd_ne {
                     ($w:expr, $a:expr, $b:expr) => {
-                        concat_idents!(smid = u, $w, x8 {
-                            <smid>::from_slice(cast_x8!($w, $a))
-                                != <smid>::from_slice(cast_x8!($w, $b))
+                        concat_idents!(simd = u, $w, x8 {
+                            <simd>::from_slice(cast_x8!($w, $a))
+                                != <simd>::from_slice(cast_x8!($w, $b))
                         })
                     };
                     ($c:expr, $d:expr, $a:expr, $b:expr) => {
@@ -753,7 +749,7 @@ mod bench {
 
         // TODO: refine this method
         #[inline(always)]
-        pub fn put<const MASK: usize>(&mut self, key: City<'a>, value: i16) -> usize {
+        pub fn put<const MASK: usize>(&mut self, (key, value): (City<'a>, i16)) -> usize {
             let index = self.hasher.hash_one(key);
             let mut index = ((index.rotate_right(RESULT_BITS * 4)
                 ^ (index >> (RESULT_BITS * 3))
@@ -766,18 +762,15 @@ mod bench {
                 match unsafe { self.inner.get_unchecked_mut(index) } {
                     MyWeatherNode::Value((city, weather)) => {
                         if !key.eq(city) {
-                            index = (index + 1319) & MASK;
                             miss += 1;
                             assert!(miss <= BITS_MASK, "Map is full!");
+                            index = (index + 1319) & MASK;
                             continue;
                         }
                         weather.count += 1;
                         weather.sum += value as i64;
-                        match value {
-                            x if x > weather.max => weather.max = x,
-                            x if x < weather.min => weather.min = x,
-                            _ => {}
-                        }
+                        weather.max = weather.max.max(value);
+                        weather.min = weather.min.min(value);
                     }
                     node => {
                         *node = MyWeatherNode::Value((key, Weather::new(value)));
@@ -823,37 +816,33 @@ mod bench {
             const MASK: $simd = <$simd>::splat(<$ty>::from_ne_bytes([$chr; U_SIZE]));
             const MASK1: $simd = <$simd>::splat(<$ty>::from_ne_bytes([0x01; U_SIZE]));
             const MASK2: $simd = <$simd>::splat(<$ty>::from_ne_bytes([0x80; U_SIZE]));
-            $data = pst_slice!($data, $leading);
-            let (mut count, mut next, end) = (0, 0, $data.len());
+            let (mut count, mut next, end) = (0, $leading, $data.len());
             // boost performance with simd
-            for _ in 0..(end / F_SIZE) {
-                let value = read_unaligned!($data.as_ptr().add(next), $simd) ^ MASK;
+            let ptr = $data.as_ptr();
+            for _ in 0..((end - $leading) / F_SIZE) {
+                let value = read_unaligned!(ptr.add(next), $simd) ^ MASK;
                 let value = ((value - MASK1) & !value & MASK2).to_array();
-                let mut off = $leading + next;
-                for j in 0..value.len() {
-                    match get!(value, j) {
-                        0 => {}
-                        mut x => loop {
-                            let v = x.trailing_zeros() >> 3;
-                            set!($positions, count, off + v as usize);
-                            x ^= 1 << ((v << 3) + 7) as u32;
-                            count += 1;
-                            if x == 0 {
-                                break;
-                            }
-                        },
+                let mut off = next;
+                for j in 0..F_SIZE / U_SIZE {
+                    let mut x = get!(value, j);
+                    while x != 0 {
+                        let v = x.trailing_zeros();
+                        set!($positions, count, off + (v >> 3) as usize);
+                        x ^= 1 << v;
+                        count += 1;
+                        if (count == SIMD_SOLTS) {
+                            return Some(SIMD_SOLTS);
+                        }
                     }
                     off += U_SIZE;
                 }
-                match count {
-                    x if x > 0 => return Some(count),
-                    _ => next += F_SIZE,
-                }
+                next += F_SIZE
             }
             for j in next..end {
-                if read_byte!($data.as_ptr(), j) == $chr {
-                    set!($positions, 0, $leading + j);
-                    return Some(1);
+                if read_byte!(ptr, j) == $chr {
+                    set!($positions, count, j);
+                    count += 1;
+                    return Some(count);
                 }
             }
             None
@@ -865,11 +854,7 @@ mod bench {
         ($name:ident, $chr: ident) => {
             #[inline(always)]
             #[allow(unused_unsafe)]
-            pub fn $name(
-                mut data: &[u8],
-                positions: &mut [usize],
-                leading: usize,
-            ) -> Option<usize> {
+            pub fn $name(data: &[u8], positions: &mut [usize], leading: usize) -> Option<usize> {
                 find_mask!($chr, data, positions, leading, u64, std::simd::u64x4)
             }
         };
@@ -1012,6 +997,7 @@ mod bench {
         ))
     }
 
+    const SIMD_SOLTS: usize = 2;
     #[allow(unused_unsafe)]
     pub fn decode_lines<'a>(
         mut data: &'a [u8],
@@ -1022,49 +1008,48 @@ mod bench {
         let mut miss = 0;
         let mut total = 0;
         let mut batch = 0;
-        let mut commas = [0; 64];
-        let mut newlns = [0; 64];
+        let mut commas = [0; SIMD_SOLTS];
+        let mut newlns = [0; SIMD_SOLTS];
         while let Some(c1) = find_comma_simd(data, &mut commas, 0)
             && let Some(c2) = find_newline_simd(data, &mut newlns, get!(commas, 0) + 1)
         {
+            batch += 1usize;
             let mut next = 0;
             macro_rules! pipeline {
-                ($i: expr) => {
+                ($i:expr) => {{
                     let comma = get!(commas, $i);
                     let city = mid_slice!(data, next..comma);
                     let newline = get!(newlns, $i);
                     let value = mid_slice!(data, (comma + 1)..newline);
                     next = newline + 1;
+                    (city.into(), parse_number(value))
+                }};
+            }
+            use concat_idents::concat_idents;
+            macro_rules! repeat {
+                ($($i:expr)*) => {
+                    $(
+                        concat_idents!(name = v, $i {
+                            let name = pipeline!($i);
+                        });
+                    )*
                     if !dry_run {
-                        miss += result.put::<BITS_MASK>(city.into(), parse_number(value));
+                    $(
+                        concat_idents!(name = v, $i {
+                            miss += result.put::<BITS_MASK>(name);
+                        });
+                    )*
                     }
                 };
             }
-            match c2.min(c1) {
-                2 => {
-                    pipeline!(0);
-                    pipeline!(1);
-                    total += 2;
-                }
-                1 => {
-                    pipeline!(0);
-                    total += 1;
-                }
-                3 => {
-                    pipeline!(0);
-                    pipeline!(1);
-                    pipeline!(2);
-                    total += 3;
-                }
-                x => {
-                    (0..x).for_each(|i| {
-                        pipeline!(i);
-                    });
-                    total += x;
-                }
+            let x = c2.min(c1);
+            if x == 2 {
+                repeat!(0 1);
+            } else {
+                repeat!(0);
             }
+            total += x;
             data = pst_slice!(data, next);
-            batch += 1;
         }
         if debug && !args().any(|a| a == "--bench") {
             eprintln!(
@@ -1078,27 +1063,23 @@ mod bench {
 
     #[inline(always)]
     fn parse_number(value: &[u8]) -> i16 {
-        macro_rules! m1 {
-            ($e:expr) => {
-                $e * 10
-            };
-        }
-        macro_rules! m2 {
-            ($e:expr) => {
-                $e * 100
-            };
-        }
+        let p = value.as_ptr();
         // signal bit 001(0)1101 => `-`
-        let s = ((!read_byte!(value.as_ptr()) & 0x10) >> 4) as usize;
+        let s = ((!read_byte!(p) & 0x10) >> 4) as usize;
         // boost performance with swar
-        let v = u32::from_be(read_unaligned!(value.as_ptr().add(s), u32))
+        let v = u32::from_be(read_unaligned!(p.add(s), u32) & 0x0F0F0F0F)
             >> ((s + 4 - value.len()) << 3);
-        (m2!((v >> 24) & 0x0F) + m1!((v >> 16) & 0x0F) + (v & 0x0F)) as i16 * (1 - (s << 1) as i16)
+        (100 * (v >> 24) + 10 * ((v << 8) >> 24) + ((v << 24) >> 24)) as i16 * (1 - (s << 1) as i16)
     }
 
     #[cfg(test)]
     pub mod tests {
-        use crate::bench::{City, WeatherMap, decode_lines, parse_number};
+        use std::fs::File;
+
+        use crate::{
+            bench::{City, WeatherMap, decode_lines, parse_number},
+            r#gen::Mmap,
+        };
         extern crate test;
 
         #[test]
@@ -1179,10 +1160,10 @@ mod bench {
 
         #[bench]
         fn bench_reduce(b: &mut test::Bencher) {
-            let data = "aaaaaaaaa;-10.0\naaaaaaaaa;26.0\ndef;2.1\n".as_bytes();
-            let mut m = WeatherMap::default();
+            let data = Mmap::open::<false>(File::open("./data/measurements.txt").unwrap()).unwrap();
             b.iter(|| {
-                decode_lines(data, &mut m, false, false);
+                let mut m = WeatherMap::default();
+                decode_lines(&data, &mut m, false, false);
             });
         }
     }
