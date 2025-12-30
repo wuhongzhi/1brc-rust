@@ -750,16 +750,20 @@ mod bench {
         // TODO: refine this method
         #[inline(always)]
         pub fn put<const MASK: usize>(&mut self, (key, value): (City<'a>, i16)) -> usize {
-            let index = self.hasher.hash_one(key);
-            let mut index = ((index.rotate_right(RESULT_BITS * 4)
-                ^ (index >> (RESULT_BITS * 3))
-                ^ (index >> (RESULT_BITS * 2))
-                ^ (index >> RESULT_BITS)
-                ^ index)
-                & MASK as u64) as usize;
-            let mut miss: usize = 0;
+            #[inline(always)]
+            fn index<'a, const MASK: usize>(hasher: &RandomState, key: City<'a>) -> usize {
+                let index = hasher.hash_one(key);
+                ((index.rotate_right(RESULT_BITS * 4)
+                    ^ (index >> (RESULT_BITS * 3))
+                    ^ (index >> (RESULT_BITS * 2))
+                    ^ (index >> RESULT_BITS)
+                    ^ index)
+                    & MASK as u64) as usize
+            }
+            let ptr = self.inner.as_mut_ptr();
+            let (mut miss, mut index) = (0, index::<MASK>(&self.hasher, key));
             loop {
-                match unsafe { self.inner.get_unchecked_mut(index) } {
+                match unsafe { &mut *ptr.add(index) } {
                     MyWeatherNode::Value((city, weather)) => {
                         if !key.eq(city) {
                             miss += 1;
@@ -801,12 +805,12 @@ mod bench {
     }
     macro_rules! set {
         ($v:expr, $i:expr, $r:expr) => {
-            unsafe { *$v.get_unchecked_mut($i) = $r };
+            unsafe { *$v.as_mut_ptr().add($i) = $r };
         };
     }
     macro_rules! get {
         ($v:expr, $i:expr) => {
-            unsafe { *$v.get_unchecked($i) }
+            unsafe { *$v.as_ptr().add($i) }
         };
     }
     macro_rules! find_mask {
