@@ -154,7 +154,7 @@ fn generate(argv: GenerateArg) -> Result<()> {
                     .unwrap(),
                 );
                 let len = cities.len();
-                for _ in 0..argv.size {
+                for j in 0..argv.size {
                     let city = &mut cities[rand!(len)];
                     let temp = format!(
                         ";{}{:.1}\n",
@@ -163,7 +163,9 @@ fn generate(argv: GenerateArg) -> Result<()> {
                     );
                     $e.write_all(&city.0)?;
                     $e.write_all(temp.as_bytes())?;
-                    bar.inc(1);
+                    if j % 10_000 == 0 && j != 0 {
+                        bar.inc(10_000);
+                    }
                     city.1 = true
                 }
             };
@@ -213,15 +215,9 @@ fn bench(argv: BenchArg) -> Result<()> {
         }
         Fork::Child => match Mmap::open::<false>(File::open(argv.data)?) {
             Ok(data) => {
-                bench::reduce(
-                    &data,
-                    argv.slice,
-                    argv.workers,
-                    argv.dry_run,
-                    argv.slice.is_none(),
-                )?
-                .write(unsafe { File::from_raw_fd(pipe_fds[1]) }, new_buf())?
-                .wait(clock)?;
+                bench::reduce(&data, argv.slice, argv.workers, argv.dry_run)?
+                    .write(unsafe { File::from_raw_fd(pipe_fds[1]) }, new_buf())?
+                    .wait(clock)?;
             }
             Err(e) => {
                 eprintln!("{e:?}");
@@ -430,14 +426,14 @@ mod r#gen {
 mod bench {
     use crate::RESULT_BITS;
     use anyhow::{Ok, Result};
-    use core::{slice, str};
+    use concat_idents::concat_idents;
+    use core::slice;
     use proc_cpuinfo::CpuInfo;
     use rapidhash::fast::RandomState;
     use rayon::prelude::*;
     use std::{
         collections::BTreeMap,
-        env::args,
-        fmt::{self, Display, Formatter},
+        fmt::Display,
         fs::File,
         hash::{BuildHasher, Hash, Hasher},
         io::Write,
@@ -466,6 +462,17 @@ mod bench {
                 count: 1,
             }
         }
+        fn write(&self, buf: &mut Vec<u8>) {
+            let mut avg = (self.sum as f64 / self.count as f64).round();
+            if avg.abs() < 1.0 {
+                avg = 0f64;
+            }
+            buf.extend_from_slice((self.min as f64 / 10f64).format(1).as_bytes());
+            buf.push(b'/');
+            buf.extend_from_slice((avg / 10f64).format(1).as_bytes());
+            buf.push(b'/');
+            buf.extend_from_slice((self.max as f64 / 10f64).format(1).as_bytes());
+        }
     }
     impl From<i16> for Weather {
         fn from(value: i16) -> Self {
@@ -478,21 +485,6 @@ mod bench {
             self.count += other.count;
             self.max = self.max.max(other.max);
             self.min = self.min.min(other.min);
-        }
-    }
-    impl Display for Weather {
-        fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-            let mut avg = (self.sum as f64 / self.count as f64).round() / 10f64;
-            if avg.abs() < 0.01 {
-                avg = 0f64;
-            }
-            write!(
-                f,
-                "{}/{}/{}",
-                (self.min as f64 / 10f64).format(1),
-                avg,
-                (self.max as f64 / 10f64).format(1),
-            )
         }
     }
     macro_rules! read_unaligned {
@@ -509,6 +501,9 @@ mod bench {
         pub fn new(name: &'a [u8]) -> Self {
             Self { name }
         }
+        pub fn write(&self, buf: &mut Vec<u8>) {
+            buf.extend_from_slice(self.name);
+        }
     }
     impl<'a> From<&'a [u8]> for City<'a> {
         fn from(value: &'a [u8]) -> Self {
@@ -522,8 +517,9 @@ mod bench {
             match a.len() >> 4 {
                 0 => a.hash(state),
                 _ => {
-                    read_unaligned!(a.as_ptr(), u64).hash(state);
-                    read_unaligned!(a.as_ptr().add(a.len() - size_of::<u64>()), u64).hash(state);
+                    let ptr = a.as_ptr();
+                    read_unaligned!(ptr, u64).hash(state);
+                    read_unaligned!(ptr.add(a.len() - size_of::<u64>()), u64).hash(state);
                 }
             }
         }
@@ -538,7 +534,6 @@ mod bench {
             #[inline(always)]
             #[allow(unused_unsafe)]
             fn fast_simd(a: &[u8], b: &[u8]) -> bool {
-                use concat_idents::concat_idents;
                 macro_rules! cast_x8 {
                     ($ty:expr, $e: expr) => {
                         concat_idents!(ty = u, $ty {
@@ -607,11 +602,6 @@ mod bench {
             }
         }
     }
-    impl<'a> Display for City<'a> {
-        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            f.write_str(unsafe { str::from_utf8_unchecked(self.name) })
-        }
-    }
     impl<'a> Deref for City<'a> {
         type Target = [u8];
 
@@ -641,13 +631,17 @@ mod bench {
                     v = &v[3..];
                 }
             }
-            if decimal > 0
-                && let Some(v) = v.next()
-            {
+            if decimal > 0 {
                 r.push('.');
-                let len = decimal.min(v.len());
-                r.push_str(&v[..len]);
-                (len..decimal).for_each(|_| r.push('0'));
+                (match v.next() {
+                    Some(v) => {
+                        let len = decimal.min(v.len());
+                        r.push_str(&v[..len]);
+                        len
+                    }
+                    _ => 0,
+                }..decimal)
+                    .for_each(|_| r.push('0'));
             }
             r
         }
@@ -675,10 +669,8 @@ mod bench {
             if off < self_end {
                 let expect_end = off + self.slice;
                 let range = off..if expect_end < self_end {
-                    match find_newline(pst_slice!(self.data, expect_end)) {
-                        Some(i) => expect_end + i + 1,
-                        None => self_end,
-                    }
+                    find_newline(pst_slice!(self.data, expect_end))
+                        .map_or(self_end, |i| expect_end + i + 1)
                 } else {
                     self_end
                 };
@@ -714,6 +706,22 @@ mod bench {
         }
     }
 
+    macro_rules! set {
+        ($v:expr, $r:expr) => {
+            unsafe { *$v = $r };
+        };
+        ($v:expr, $i:expr, $r:expr) => {
+            unsafe { *$v.add($i) = $r };
+        };
+    }
+    macro_rules! get {
+        ($v:expr) => {
+            unsafe { *$v }
+        };
+        ($v:expr, $i:expr) => {
+            unsafe { *$v.add($i) }
+        };
+    }
     #[allow(dead_code)]
     impl<'a> MyWeatherMap<'a> {
         pub fn reset(&mut self) -> &mut Self {
@@ -749,38 +757,36 @@ mod bench {
 
         // TODO: refine this method
         #[inline(always)]
-        pub fn put<const MASK: usize>(&mut self, (key, value): (City<'a>, i16)) -> usize {
+        pub fn put<const MASK: usize>(&mut self, (key, value): (City<'a>, i16)) {
             #[inline(always)]
-            fn index<'a, const MASK: usize>(hasher: &RandomState, key: City<'a>) -> usize {
-                let index = hasher.hash_one(key);
-                ((index.rotate_right(RESULT_BITS * 4)
-                    ^ (index >> (RESULT_BITS * 3))
+            fn index(index: u64) -> usize {
+                (/* index.rotate_right(RESULT_BITS * 4)
+                ^  */(index >> (RESULT_BITS * 3))
                     ^ (index >> (RESULT_BITS * 2))
                     ^ (index >> RESULT_BITS)
-                    ^ index)
-                    & MASK as u64) as usize
+                    ^ index) as usize
             }
             let ptr = self.inner.as_mut_ptr();
-            let (mut miss, mut index) = (0, index::<MASK>(&self.hasher, key));
+            let (mut miss, mut index) = (0, index(self.hasher.hash_one(key)) & MASK);
             loop {
                 match unsafe { &mut *ptr.add(index) } {
                     MyWeatherNode::Value((city, weather)) => {
-                        if !key.eq(city) {
-                            miss += 1;
-                            assert!(miss <= BITS_MASK, "Map is full!");
-                            index = (index + 1319) & MASK;
-                            continue;
+                        if key.eq(city) {
+                            weather.count += 1;
+                            weather.sum += value as i64;
+                            weather.max = weather.max.max(value);
+                            weather.min = weather.min.min(value);
+                            break;
                         }
-                        weather.count += 1;
-                        weather.sum += value as i64;
-                        weather.max = weather.max.max(value);
-                        weather.min = weather.min.min(value);
+                        miss += 1;
+                        assert!(miss <= BITS_MASK, "Map is full!");
+                        index = (index + 9337) & MASK;
                     }
                     node => {
-                        *node = MyWeatherNode::Value((key, Weather::new(value)));
+                        *node = MyWeatherNode::Value((key, value.into()));
+                        break;
                     }
                 }
-                break miss;
             }
         }
     }
@@ -793,8 +799,9 @@ mod bench {
         type Item = (City<'a>, Weather);
 
         fn next(&mut self) -> Option<Self::Item> {
+            let ptr = self.inner.as_mut_ptr();
             while self.pos < self.inner.len() {
-                if let MyWeatherNode::Value(x) = unsafe { self.inner.get_unchecked_mut(self.pos) } {
+                if let MyWeatherNode::Value(x) = unsafe { &mut *ptr.add(self.pos) } {
                     self.pos += 1;
                     return Some(*x);
                 }
@@ -803,68 +810,6 @@ mod bench {
             None
         }
     }
-    macro_rules! set {
-        ($v:expr, $i:expr, $r:expr) => {
-            unsafe { *$v.as_mut_ptr().add($i) = $r };
-        };
-    }
-    macro_rules! get {
-        ($v:expr, $i:expr) => {
-            unsafe { *$v.as_ptr().add($i) }
-        };
-    }
-    macro_rules! find_mask {
-        ($chr:expr, $data:expr, $positions:expr, $leading:expr, $ty:ty, $simd:ty) => {{
-            const U_SIZE: usize = size_of::<$ty>();
-            const F_SIZE: usize = size_of::<$simd>();
-            const MASK: $simd = <$simd>::splat(<$ty>::from_ne_bytes([$chr; U_SIZE]));
-            const MASK1: $simd = <$simd>::splat(<$ty>::from_ne_bytes([0x01; U_SIZE]));
-            const MASK2: $simd = <$simd>::splat(<$ty>::from_ne_bytes([0x80; U_SIZE]));
-            let (mut count, mut next, end) = (0, $leading, $data.len());
-            // boost performance with simd
-            let ptr = $data.as_ptr();
-            for _ in 0..((end - $leading) / F_SIZE) {
-                let value = read_unaligned!(ptr.add(next), $simd) ^ MASK;
-                let value = ((value - MASK1) & !value & MASK2).to_array();
-                let mut off = next;
-                for j in 0..F_SIZE / U_SIZE {
-                    let mut x = get!(value, j);
-                    while x != 0 {
-                        let v = x.trailing_zeros();
-                        set!($positions, count, off + (v >> 3) as usize);
-                        x ^= 1 << v;
-                        count += 1;
-                        if (count == SIMD_SOLTS) {
-                            return Some(SIMD_SOLTS);
-                        }
-                    }
-                    off += U_SIZE;
-                }
-                next += F_SIZE
-            }
-            for j in next..end {
-                if read_byte!(ptr, j) == $chr {
-                    set!($positions, count, j);
-                    count += 1;
-                    return Some(count);
-                }
-            }
-            None
-        }};
-    }
-    const CHR_NL: u8 = b'\n';
-    const CHR_CM: u8 = b';';
-    macro_rules! define_find {
-        ($name:ident, $chr: ident) => {
-            #[inline(always)]
-            #[allow(unused_unsafe)]
-            pub fn $name(data: &[u8], positions: &mut [usize], leading: usize) -> Option<usize> {
-                find_mask!($chr, data, positions, leading, u64, std::simd::u64x4)
-            }
-        };
-    }
-    define_find!(find_comma_simd, CHR_CM);
-    define_find!(find_newline_simd, CHR_NL);
 
     #[inline(always)]
     pub fn find_newline(data: &[u8]) -> Option<usize> {
@@ -873,9 +818,10 @@ mod bench {
         const MASK1: u64 = u64::from_ne_bytes([0x01; F_SIZE]);
         const MASK2: u64 = u64::from_ne_bytes([0x80; F_SIZE]);
         let (mut off, end) = (0, data.len());
+        let ptr = data.as_ptr();
         // boost performance with swar
         for _ in 0..(end / F_SIZE) {
-            let mut value = read_unaligned!(data.as_ptr().add(off), u64) ^ MASK;
+            let mut value = read_unaligned!(ptr.add(off), u64) ^ MASK;
             value = (value - MASK1) & !value & MASK2;
             if value != 0 {
                 return Some(off + (value.trailing_zeros() >> 3) as usize);
@@ -883,7 +829,7 @@ mod bench {
             off += F_SIZE;
         }
         for j in off..end {
-            if read_byte!(data.as_ptr(), j) == CHR_NL {
+            if read_byte!(ptr, j) == CHR_NL {
                 return Some(j);
             }
         }
@@ -891,7 +837,7 @@ mod bench {
     }
 
     #[repr(transparent)]
-    pub struct Reduce<'a>((BTreeMap<City<'a>, Weather>, usize));
+    pub struct Reduce<'a>((BTreeMap<City<'a>, Weather>, u64));
 
     impl<'a> Reduce<'a> {
         pub fn write(self, mut file: File, mut buf: ManuallyDrop<Vec<u8>>) -> Result<Self> {
@@ -904,7 +850,9 @@ mod bench {
                     if id != 0 {
                         buf.extend_from_slice(", ".as_bytes());
                     }
-                    buf.extend_from_slice(format!("{city}={weather}").as_bytes());
+                    city.write(&mut buf);
+                    buf.push(b'=');
+                    weather.write(&mut buf);
                 });
             buf.extend_from_slice("}\n".as_bytes());
             file.write_all(&buf)?;
@@ -928,17 +876,13 @@ mod bench {
         slice: Option<usize>,
         workers: Option<usize>,
         dry_run: bool,
-        debug: bool,
     ) -> Result<Reduce<'_>> {
-        fn map<'a>(
-            dry_run: bool,
-            debug: bool,
-        ) -> impl Fn(&'a [u8]) -> (BTreeMap<City<'a>, Weather>, usize) {
+        fn map<'a>(dry_run: bool) -> impl Fn(&'a [u8]) -> (BTreeMap<City<'a>, Weather>, u64) {
             move |part| {
                 let clock = SystemTime::now();
                 let mut cities = WeatherMap::default();
-                let total = decode_lines(part, &mut cities, dry_run, debug);
-                if debug {
+                let total = decode_lines(part, &mut cities, dry_run);
+                if dry_run {
                     eprintln!(
                         "{:?} -> decode {} lines within {}ms",
                         thread::current().id(),
@@ -952,9 +896,9 @@ mod bench {
             }
         }
         fn reduce<'a>(
-            mut result: (BTreeMap<City<'a>, Weather>, usize),
-            cities: (BTreeMap<City<'a>, Weather>, usize),
-        ) -> (BTreeMap<City<'a>, Weather>, usize) {
+            mut result: (BTreeMap<City<'a>, Weather>, u64),
+            cities: (BTreeMap<City<'a>, Weather>, u64),
+        ) -> (BTreeMap<City<'a>, Weather>, u64) {
             cities.0.into_iter().for_each(|(city, value)| {
                 result
                     .0
@@ -984,7 +928,7 @@ mod bench {
         );
         Ok(Reduce(
             match cpu_cores {
-                1 => scanner.map(map(dry_run, debug)).reduce(reduce),
+                1 => scanner.map(map(dry_run)).reduce(reduce),
                 _ => {
                     rayon::ThreadPoolBuilder::new()
                         .thread_name(|i| format!("decode-worker-{i}"))
@@ -993,7 +937,7 @@ mod bench {
                     scanner
                         .par_bridge()
                         .into_par_iter()
-                        .map(map(dry_run, debug))
+                        .map(map(dry_run))
                         .reduce_with(reduce)
                 }
             }
@@ -1001,35 +945,82 @@ mod bench {
         ))
     }
 
+    macro_rules! find_mask {
+        ($chr:expr, $data:expr, $pos_ptr:expr, $leading:expr, $ty:ty, $simd:ty) => {{
+            const U_SIZE: usize = size_of::<$ty>();
+            const F_SIZE: usize = size_of::<$simd>();
+            const MASK: $simd = <$simd>::splat(<$ty>::from_ne_bytes([$chr; U_SIZE]));
+            const MASK1: $simd = <$simd>::splat(<$ty>::from_ne_bytes([0x01; U_SIZE]));
+            const MASK2: $simd = <$simd>::splat(<$ty>::from_ne_bytes([0x80; U_SIZE]));
+            let (mut count, mut next, end) = (0, $leading, $data.len());
+            // boost performance with simd
+            let data_ptr = $data.as_ptr();
+            for _ in 0..((end - next) / F_SIZE) {
+                let value = read_unaligned!(data_ptr.add(next), $simd) ^ MASK;
+                let value = ((value - MASK1) & !value & MASK2).to_array();
+                let mut off = next;
+                for j in 0..F_SIZE / U_SIZE {
+                    let mut x = get!(value.as_ptr(), j);
+                    while x != 0 {
+                        let v = x.trailing_zeros();
+                        set!($pos_ptr, count, off + (v >> 3) as usize);
+                        x ^= 1 << v;
+                        count += 1;
+                        if (count == SIMD_SOLTS) {
+                            return Some(SIMD_SOLTS);
+                        }
+                    }
+                    off += U_SIZE;
+                }
+                next += F_SIZE
+            }
+            for j in next..end {
+                if read_byte!(data_ptr, j) == $chr {
+                    set!($pos_ptr, count, j);
+                    count += 1;
+                    return Some(count);
+                }
+            }
+            None
+        }};
+    }
+
+    const CHR_NL: u8 = b'\n';
+    const CHR_CM: u8 = b';';
+    macro_rules! define_find {
+        ($name:ident, $chr: ident) => {
+            #[inline(always)]
+            #[allow(unused_unsafe)]
+            pub fn $name(data: &[u8], pos_ptr: *mut usize, leading: usize) -> Option<usize> {
+                find_mask!($chr, data, pos_ptr, leading, u64, std::simd::u64x4)
+            }
+        };
+    }
+    define_find!(find_comma_simd, CHR_CM);
+    define_find!(find_newline_simd, CHR_NL);
+
     const SIMD_SOLTS: usize = 2;
     #[allow(unused_unsafe)]
-    pub fn decode_lines<'a>(
-        mut data: &'a [u8],
-        result: &mut WeatherMap<'a>,
-        dry_run: bool,
-        debug: bool,
-    ) -> usize {
-        let mut miss = 0;
-        let mut total = 0;
-        let mut batch = 0;
+    pub fn decode_lines<'a>(mut data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
+        let mut total = 0u64;
         let mut commas = [0; SIMD_SOLTS];
         let mut newlns = [0; SIMD_SOLTS];
-        while let Some(c1) = find_comma_simd(data, &mut commas, 0)
-            && let Some(c2) = find_newline_simd(data, &mut newlns, get!(commas, 0) + 1)
+        let commas_ptr = commas.as_mut_ptr();
+        let newlns_ptr = newlns.as_mut_ptr();
+        while let Some(c1) = find_comma_simd(data, commas_ptr, 0)
+            && let Some(c2) = find_newline_simd(data, newlns_ptr, get!(commas_ptr) + 1)
         {
-            batch += 1usize;
             let mut next = 0;
             macro_rules! pipeline {
                 ($i:expr) => {{
-                    let comma = get!(commas, $i);
+                    let comma = get!(commas_ptr, $i);
                     let city = mid_slice!(data, next..comma);
-                    let newline = get!(newlns, $i);
+                    let newline = get!(newlns_ptr, $i);
                     let value = mid_slice!(data, (comma + 1)..newline);
                     next = newline + 1;
                     (city.into(), parse_number(value))
                 }};
             }
-            use concat_idents::concat_idents;
             macro_rules! repeat {
                 ($($i:expr)*) => {
                     $(
@@ -1040,27 +1031,26 @@ mod bench {
                     if !dry_run {
                     $(
                         concat_idents!(name = v, $i {
-                            miss += result.put::<BITS_MASK>(name);
+                            result.put::<BITS_MASK>(name);
                         });
                     )*
                     }
                 };
             }
-            let x = c2.min(c1);
-            if x == 2 {
-                repeat!(0 1);
-            } else {
-                repeat!(0);
-            }
-            total += x;
+            total += match c2.min(c1) {
+                SIMD_SOLTS => {
+                    repeat!(0 1);
+                    SIMD_SOLTS
+                }
+                x => {
+                    // (0..x).for_each(|i| {
+                    //     repeat!(i);
+                    // });
+                    repeat!(0);
+                    x
+                }
+            } as u64;
             data = pst_slice!(data, next);
-        }
-        if debug && !args().any(|a| a == "--bench") {
-            eprintln!(
-                "Miss Ratio {}%, {} L/B",
-                (miss as f64 * 1_00f64 / total as f64).format(3),
-                (total as f64 / batch as f64).format(3)
-            );
         }
         total
     }
@@ -1078,12 +1068,11 @@ mod bench {
 
     #[cfg(test)]
     pub mod tests {
-        use std::fs::File;
-
         use crate::{
             bench::{City, WeatherMap, decode_lines, parse_number},
             r#gen::Mmap,
         };
+        use std::fs::File;
         extern crate test;
 
         #[test]
@@ -1102,7 +1091,7 @@ mod bench {
         pub fn test_decode() {
             let data = "aaaaaaaaa;-10.0\naaaaaaaaa;26.0\ndef;2.1\n".as_bytes();
             let mut m = WeatherMap::default();
-            decode_lines(data, &mut m, false, false);
+            decode_lines(data, &mut m, false);
             assert_eq!(m.len(), 2);
             let r = m.get(&City::new("aaaaaaaaa".as_bytes())).unwrap();
             assert_eq!(r.count, 2);
@@ -1167,7 +1156,7 @@ mod bench {
             let data = Mmap::open::<false>(File::open("./data/measurements.txt").unwrap()).unwrap();
             b.iter(|| {
                 let mut m = WeatherMap::default();
-                decode_lines(&data, &mut m, false, false);
+                decode_lines(&data, &mut m, false);
             });
         }
     }
