@@ -31,11 +31,8 @@ macro_rules! pst_slice {
     };
 }
 macro_rules! mid_slice {
-    ($d:expr, $i:expr) => {
-        unsafe {
-            let r = $i;
-            slice::from_raw_parts($d.as_ptr().add(r.start), r.len())
-        }
+    ($d:expr, $s:expr, $e:expr) => {
+        unsafe { slice::from_raw_parts($d.as_ptr().add($s), $e - ($s)) }
     };
 }
 macro_rules! read_byte {
@@ -598,7 +595,7 @@ mod bench {
             } else if fast_detect(a, b) {
                 false
             } else {
-                fast_simd(mid_slice!(a, 1..len - 2), mid_slice!(b, 1..len - 2))
+                fast_simd(mid_slice!(a, 1, len - 2), mid_slice!(b, 1, len - 2))
             }
         }
     }
@@ -675,7 +672,7 @@ mod bench {
                     self_end
                 };
                 self.off = range.end;
-                Some(mid_slice!(self.data, range))
+                Some(mid_slice!(self.data, range.start, range.end))
             } else {
                 None
             }
@@ -811,31 +808,6 @@ mod bench {
         }
     }
 
-    #[inline(always)]
-    pub fn find_newline(data: &[u8]) -> Option<usize> {
-        const F_SIZE: usize = size_of::<u64>();
-        const MASK: u64 = u64::from_ne_bytes([CHR_NL; F_SIZE]);
-        const MASK1: u64 = u64::from_ne_bytes([0x01; F_SIZE]);
-        const MASK2: u64 = u64::from_ne_bytes([0x80; F_SIZE]);
-        let (mut off, end) = (0, data.len());
-        let ptr = data.as_ptr();
-        // boost performance with swar
-        for _ in 0..(end / F_SIZE) {
-            let mut value = read_unaligned!(ptr.add(off), u64) ^ MASK;
-            value = (value - MASK1) & !value & MASK2;
-            if value != 0 {
-                return Some(off + (value.trailing_zeros() >> 3) as usize);
-            }
-            off += F_SIZE;
-        }
-        for j in off..end {
-            if read_byte!(ptr, j) == CHR_NL {
-                return Some(j);
-            }
-        }
-        None
-    }
-
     #[repr(transparent)]
     pub struct Reduce<'a>((BTreeMap<City<'a>, Weather>, u64));
 
@@ -945,78 +917,242 @@ mod bench {
         ))
     }
 
+    const CHR_NL: u8 = b'\n';
+    const CHR_CM: u8 = b';';
+    type FindBase = u64;
+    type FindSimd = std::simd::u64x4;
+    //min 7 byets one solt (ab;y.z\n)
+    const SIMD_SOLTS: usize = (size_of::<FindSimd>() as f32 / 7f32).ceil() as usize;
+
+    const BASE_SIZE: usize = size_of::<FindBase>();
+    const FIND_SIZE: usize = size_of::<FindSimd>();
+    const FIND_MASK1: FindSimd = FindSimd::splat(FindBase::from_ne_bytes([0x01; BASE_SIZE]));
+    const FIND_MASK2: FindSimd = FindSimd::splat(FindBase::from_ne_bytes([0x80; BASE_SIZE]));
+
+    #[inline(always)]
+    pub fn find_newline(data: &[u8]) -> Option<usize> {
+        const MASK: FindBase = FindBase::from_ne_bytes([CHR_NL; BASE_SIZE]);
+        const MASK1: FindBase = FindBase::from_ne_bytes([0x01; BASE_SIZE]);
+        const MASK2: FindBase = FindBase::from_ne_bytes([0x80; BASE_SIZE]);
+        let (mut off, end) = (0, data.len());
+        let ptr = data.as_ptr();
+        // boost performance with swar
+        for _ in 0..end / BASE_SIZE {
+            let mut value = read_unaligned!(ptr.add(off), FindBase) ^ MASK;
+            value = (value - MASK1) & !value & MASK2;
+            if value != 0 {
+                return Some(off + (value.trailing_zeros() >> 3) as usize);
+            }
+            off += BASE_SIZE;
+        }
+        for j in off..end {
+            if read_byte!(ptr, j) == CHR_NL {
+                return Some(j);
+            }
+        }
+        None
+    }
+
+    // struct Tokenizer<'a> {
+    //     cache: [usize; SIMD_SOLTS],
+    //     cache_offset: usize,
+    //     cache_length: usize,
+    //     data: &'a [u8],
+    //     data_offset: usize,
+    //     data_align: usize,
+    //     chr: u8,
+    //     mask: usize,
+    // }
+    // impl<'a> Tokenizer<'a> {
+    //     fn new(data: &'a [u8], chr: u8) -> Self {
+    //         Self {
+    //             data,
+    //             chr,
+    //             cache: [0; SIMD_SOLTS],
+    //             cache_length: 0,
+    //             cache_offset: 0,
+    //             data_offset: 0,
+    //             data_align: 0,
+    //             mask: if chr == CHR_CM { 0 } else { 1 },
+    //         }
+    //         .align()
+    //     }
+
+    //     #[inline(always)]
+    //     fn align(mut self) -> Self {
+    //         let end = self.data.len();
+    //         if self.data_offset < end {
+    //             self.data_align = match self.data.as_ptr().addr() % FIND_SIZE {
+    //                 0 => end / FIND_SIZE * FIND_SIZE,
+    //                 mut unaligned => {
+    //                     let mut count = 0;
+    //                     unaligned = (FIND_SIZE - unaligned).min(end);
+    //                     for i in 0..unaligned {
+    //                         if read_byte!(self.data.as_ptr(), i) == self.chr {
+    //                             set!(self.cache.as_mut_ptr(), count, i);
+    //                             count += 1;
+    //                         }
+    //                     }
+    //                     if count != 0 {
+    //                         self.cache_offset = 0;
+    //                         self.cache_length = count;
+    //                     }
+    //                     self.data_offset = unaligned;
+    //                     (end - unaligned) / FIND_SIZE * FIND_SIZE
+    //                 }
+    //             };
+    //         }
+    //         self
+    //     }
+
+    //     #[inline(always)]
+    //     fn fill(&mut self) -> bool {
+    //         const MASK: [FindSimd; 2] = [
+    //             FindSimd::splat(FindBase::from_ne_bytes([CHR_CM; BASE_SIZE])),
+    //             FindSimd::splat(FindBase::from_ne_bytes([CHR_NL; BASE_SIZE])),
+    //         ];
+    //         let mut count = 0;
+    //         macro_rules! check_result {
+    //             ($delta:expr) => {
+    //                 self.data_offset += $delta;
+    //                 if count != 0 {
+    //                     self.cache_offset = 0;
+    //                     self.cache_length = count;
+    //                     return true;
+    //                 }
+    //             };
+    //         }
+    //         while self.data_offset < self.data_align {
+    //             let mut value = get!(MASK.as_ptr(), self.mask)
+    //                 ^ get!(self.data.as_ptr().add(self.data_offset).cast::<FindSimd>());
+    //             value = (value - FIND_MASK1) & !value & FIND_MASK2;
+    //             let val_ptr = value.as_array().as_ptr();
+    //             let mut off = self.data_offset;
+    //             for j in 0..FIND_SIZE / BASE_SIZE {
+    //                 let mut x = get!(val_ptr, j);
+    //                 while x != 0 {
+    //                     let v = x.trailing_zeros();
+    //                     set!(self.cache.as_mut_ptr(), count, off + (v >> 3) as usize);
+    //                     x ^= 1 << v;
+    //                     count += 1;
+    //                 }
+    //                 off += BASE_SIZE;
+    //             }
+    //             check_result!(FIND_SIZE);
+    //         }
+    //         for j in self.data_offset..self.data.len() {
+    //             if read_byte!(self.data.as_ptr(), j) == self.chr {
+    //                 set!(self.cache.as_mut_ptr(), count, j);
+    //                 count += 1;
+    //             }
+    //         }
+    //         check_result!(self.data.len() - self.data_offset);
+    //         false
+    //     }
+
+    //     #[inline(always)]
+    //     fn next(&mut self) -> usize {
+    //         if self.cache_offset < self.cache_length || self.fill() {
+    //             let r = get!(self.cache.as_ptr(), self.cache_offset);
+    //             self.cache_offset += 1;
+    //             r
+    //         } else {
+    //             0
+    //         }
+    //     }
+    // }
+
+    // #[allow(unused_unsafe)]
+    // pub fn decode_lines<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
+    //     let mut commas = Tokenizer::new(data, CHR_CM);
+    //     let mut newlines = Tokenizer::new(data, CHR_NL);
+    //     let mut next = 0usize;
+    //     let mut total = 0u64;
+    //     while let comma = commas.next()
+    //         && comma != 0
+    //         && let newline = newlines.next()
+    //         && newline != 0
+    //     {
+    //         let city = mid_slice!(data, next, comma);
+    //         let value = mid_slice!(data, comma + 1, newline);
+    //         let pair = (city.into(), parse_number(value));
+    //         if !dry_run {
+    //             result.put::<BITS_MASK>(pair);
+    //         }
+    //         next = newline + 1;
+    //         total += 1;
+    //     }
+    //     total
+    // }
+
     macro_rules! find_mask {
-        ($chr:expr, $data:expr, $pos_ptr:expr, $leading:expr, $ty:ty, $simd:ty) => {{
-            const U_SIZE: usize = size_of::<$ty>();
-            const F_SIZE: usize = size_of::<$simd>();
-            const MASK: $simd = <$simd>::splat(<$ty>::from_ne_bytes([$chr; U_SIZE]));
-            const MASK1: $simd = <$simd>::splat(<$ty>::from_ne_bytes([0x01; U_SIZE]));
-            const MASK2: $simd = <$simd>::splat(<$ty>::from_ne_bytes([0x80; U_SIZE]));
+        ($chr:expr, $data:expr, $pos_ptr:expr, $leading:expr) => {{
+            const MASK: FindSimd = FindSimd::splat(FindBase::from_ne_bytes([$chr; BASE_SIZE]));
             let (mut count, mut next, end) = (0, $leading, $data.len());
-            // boost performance with simd
             let data_ptr = $data.as_ptr();
-            for _ in 0..((end - next) / F_SIZE) {
-                let value = read_unaligned!(data_ptr.add(next), $simd) ^ MASK;
-                let value = ((value - MASK1) & !value & MASK2).to_array();
+            // boost performance with simd
+            for _ in 0..(end - next) / FIND_SIZE {
+                let mut value = read_unaligned!(data_ptr.add(next), FindSimd) ^ MASK;
+                value = (value - FIND_MASK1) & !value & FIND_MASK2;
+                let val_ptr = value.as_array().as_ptr();
                 let mut off = next;
-                for j in 0..F_SIZE / U_SIZE {
-                    let mut x = get!(value.as_ptr(), j);
+                for j in 0..FIND_SIZE / BASE_SIZE {
+                    let mut x = get!(val_ptr, j);
                     while x != 0 {
                         let v = x.trailing_zeros();
                         set!($pos_ptr, count, off + (v >> 3) as usize);
                         x ^= 1 << v;
                         count += 1;
-                        if (count == SIMD_SOLTS) {
-                            return Some(SIMD_SOLTS);
-                        }
                     }
-                    off += U_SIZE;
+                    off += BASE_SIZE;
                 }
-                next += F_SIZE
+                match count {
+                    0 => next += FIND_SIZE,
+                    x => return Some(x),
+                }
             }
             for j in next..end {
                 if read_byte!(data_ptr, j) == $chr {
                     set!($pos_ptr, count, j);
                     count += 1;
-                    return Some(count);
                 }
             }
-            None
+            match count {
+                0 => None,
+                x => Some(x),
+            }
         }};
     }
 
-    const CHR_NL: u8 = b'\n';
-    const CHR_CM: u8 = b';';
     macro_rules! define_find {
         ($name:ident, $chr: ident) => {
             #[inline(always)]
             #[allow(unused_unsafe)]
             pub fn $name(data: &[u8], pos_ptr: *mut usize, leading: usize) -> Option<usize> {
-                find_mask!($chr, data, pos_ptr, leading, u64, std::simd::u64x4)
+                find_mask!($chr, data, pos_ptr, leading)
             }
         };
     }
     define_find!(find_comma_simd, CHR_CM);
     define_find!(find_newline_simd, CHR_NL);
 
-    const SIMD_SOLTS: usize = 2;
     #[allow(unused_unsafe)]
     pub fn decode_lines<'a>(mut data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
         let mut total = 0u64;
         let mut commas = [0; SIMD_SOLTS];
         let mut newlns = [0; SIMD_SOLTS];
-        let commas_ptr = commas.as_mut_ptr();
-        let newlns_ptr = newlns.as_mut_ptr();
-        while let Some(c1) = find_comma_simd(data, commas_ptr, 0)
-            && let Some(c2) = find_newline_simd(data, newlns_ptr, get!(commas_ptr) + 1)
+        let cma_ptr = commas.as_mut_ptr();
+        let nls_ptr = newlns.as_mut_ptr();
+        while let Some(c1) = find_comma_simd(data, cma_ptr, 0)
+            && let Some(c2) = find_newline_simd(data, nls_ptr, get!(cma_ptr) + 1)
         {
             let mut next = 0;
             macro_rules! pipeline {
                 ($i:expr) => {{
-                    let comma = get!(commas_ptr, $i);
-                    let city = mid_slice!(data, next..comma);
-                    let newline = get!(newlns_ptr, $i);
-                    let value = mid_slice!(data, (comma + 1)..newline);
+                    let comma = get!(cma_ptr, $i);
+                    let city = mid_slice!(data, next, comma);
+                    let newline = get!(nls_ptr, $i);
+                    let value = mid_slice!(data, comma + 1, newline);
                     next = newline + 1;
                     (city.into(), parse_number(value))
                 }};
@@ -1038,18 +1174,19 @@ mod bench {
                 };
             }
             total += match c2.min(c1) {
-                SIMD_SOLTS => {
+                x if x > 3 => {
+                    repeat!(0 1 2 3);
+                    4
+                }
+                x if x > 1 => {
                     repeat!(0 1);
-                    SIMD_SOLTS
+                    2
                 }
-                x => {
-                    // (0..x).for_each(|i| {
-                    //     repeat!(i);
-                    // });
+                _ => {
                     repeat!(0);
-                    x
+                    1
                 }
-            } as u64;
+            };
             data = pst_slice!(data, next);
         }
         total
@@ -1152,6 +1289,7 @@ mod bench {
         }
 
         #[bench]
+        #[ignore]
         fn bench_reduce(b: &mut test::Bencher) {
             let data = Mmap::open::<false>(File::open("./data/measurements.txt").unwrap()).unwrap();
             b.iter(|| {
