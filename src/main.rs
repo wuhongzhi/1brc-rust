@@ -905,6 +905,7 @@ mod bench {
                     rayon::ThreadPoolBuilder::new()
                         .thread_name(|i| format!("decode-worker-{i}"))
                         .num_threads(cpu_cores)
+                        .use_current_thread()
                         .build_global()?;
                     scanner
                         .par_bridge()
@@ -1026,10 +1027,10 @@ mod bench {
     //             let mut value = get!(MASK.as_ptr(), self.mask)
     //                 ^ get!(self.data.as_ptr().add(self.data_offset).cast::<FindSimd>());
     //             value = (value - FIND_MASK1) & !value & FIND_MASK2;
-    //             let val_ptr = value.as_array().as_ptr();
+    //             let value = value.as_array();
     //             let mut off = self.data_offset;
     //             for j in 0..FIND_SIZE / BASE_SIZE {
-    //                 let mut x = get!(val_ptr, j);
+    //                 let mut x = get!(value.as_ptr(), j);
     //                 while x != 0 {
     //                     let v = x.trailing_zeros();
     //                     set!(self.cache.as_mut_ptr(), count, off + (v >> 3) as usize);
@@ -1051,14 +1052,26 @@ mod bench {
     //     }
 
     //     #[inline(always)]
-    //     fn next(&mut self) -> usize {
-    //         if self.cache_offset < self.cache_length || self.fill() {
+    //     fn next(&mut self) -> (usize, usize) {
+    //         macro_rules! available {
+    //             () => {
+    //                 self.cache_length - self.cache_offset
+    //             };
+    //         }
+    //         if available!() > 0 || self.fill() {
     //             let r = get!(self.cache.as_ptr(), self.cache_offset);
     //             self.cache_offset += 1;
-    //             r
+    //             (r, available!())
     //         } else {
-    //             0
+    //             (0, 0)
     //         }
+    //     }
+
+    //     #[inline(always)]
+    //     fn take(&mut self) -> usize {
+    //         let r = get!(self.cache.as_ptr(), self.cache_offset);
+    //         self.cache_offset += 1;
+    //         r
     //     }
     // }
 
@@ -1066,21 +1079,54 @@ mod bench {
     // pub fn decode_lines<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
     //     let mut commas = Tokenizer::new(data, CHR_CM);
     //     let mut newlines = Tokenizer::new(data, CHR_NL);
-    //     let mut next = 0usize;
-    //     let mut total = 0u64;
-    //     while let comma = commas.next()
+    //     let (mut leading, mut total) = (0, 0u64);
+    //     while let (mut comma, c1) = commas.next()
+    //         && let (mut newline, c2) = newlines.next()
     //         && comma != 0
-    //         && let newline = newlines.next()
     //         && newline != 0
     //     {
-    //         let city = mid_slice!(data, next, comma);
-    //         let value = mid_slice!(data, comma + 1, newline);
-    //         let pair = (city.into(), parse_number(value));
-    //         if !dry_run {
-    //             result.put::<BITS_MASK>(pair);
+    //         macro_rules! pipeline {
+    //             ($comma:expr, $newline: expr) => {{
+    //                 let city = mid_slice!(data, leading, $comma);
+    //                 let value = mid_slice!(data, $comma + 1, $newline);
+    //                 leading = $newline + 1;
+    //                 (city.into(), parse_number(value))
+    //             }};
     //         }
-    //         next = newline + 1;
-    //         total += 1;
+    //         let v0 = pipeline!(comma, newline);
+    //         macro_rules! repeat {
+    //             ($($i: expr)*) => {{
+    //                 $(
+    //                     concat_idents!(name = v, $i {
+    //                         comma = commas.take();
+    //                         newline = newlines.take();
+    //                         let name = pipeline!(comma, newline);
+    //                     });
+    //                 )*
+    //                 if !dry_run {
+    //                     result.put::<BITS_MASK>(v0);
+    //                     $(
+    //                         concat_idents!(name = v, $i {
+    //                             result.put::<BITS_MASK>(name);
+    //                         });
+    //                     )*
+    //                 }
+    //             }};
+    //         }
+    //         total += match c2.min(c1) {
+    //             x if x > 2 => {
+    //                 repeat!(1 2 3);
+    //                 4
+    //             }
+    //             x if x > 0 => {
+    //                 repeat!(1);
+    //                 2
+    //             }
+    //             _ => {
+    //                 repeat!();
+    //                 1
+    //             }
+    //         }
     //     }
     //     total
     // }
@@ -1088,16 +1134,15 @@ mod bench {
     macro_rules! find_mask {
         ($chr:expr, $data:expr, $pos_ptr:expr, $leading:expr) => {{
             const MASK: FindSimd = FindSimd::splat(FindBase::from_ne_bytes([$chr; BASE_SIZE]));
-            let (mut count, mut next, end) = (0, $leading, $data.len());
-            let data_ptr = $data.as_ptr();
+            let (mut count, mut leading, end) = (0, $leading, $data.len());
             // boost performance with simd
-            for _ in 0..(end - next) / FIND_SIZE {
-                let mut value = read_unaligned!(data_ptr.add(next), FindSimd) ^ MASK;
+            for _ in 0..(end - leading) / FIND_SIZE {
+                let mut value = read_unaligned!($data.as_ptr().add(leading), FindSimd) ^ MASK;
                 value = (value - FIND_MASK1) & !value & FIND_MASK2;
-                let val_ptr = value.as_array().as_ptr();
-                let mut off = next;
+                let value = value.as_array();
+                let mut off = leading;
                 for j in 0..FIND_SIZE / BASE_SIZE {
-                    let mut x = get!(val_ptr, j);
+                    let mut x = get!(value.as_ptr(), j);
                     while x != 0 {
                         let v = x.trailing_zeros();
                         set!($pos_ptr, count, off + (v >> 3) as usize);
@@ -1107,12 +1152,12 @@ mod bench {
                     off += BASE_SIZE;
                 }
                 match count {
-                    0 => next += FIND_SIZE,
+                    0 => leading += FIND_SIZE,
                     x => return Some(x),
                 }
             }
-            for j in next..end {
-                if read_byte!(data_ptr, j) == $chr {
+            for j in leading..end {
+                if read_byte!($data.as_ptr(), j) == $chr {
                     set!($pos_ptr, count, j);
                     count += 1;
                 }
@@ -1137,23 +1182,22 @@ mod bench {
     define_find!(find_newline_simd, CHR_NL);
 
     #[allow(unused_unsafe)]
-    pub fn decode_lines<'a>(mut data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
-        let mut total = 0u64;
+    pub fn decode_lines<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
         let mut commas = [0; SIMD_SOLTS];
         let mut newlns = [0; SIMD_SOLTS];
         let cma_ptr = commas.as_mut_ptr();
         let nls_ptr = newlns.as_mut_ptr();
-        while let Some(c1) = find_comma_simd(data, cma_ptr, 0)
+        let (mut leading, mut total) = (0, 0u64);
+        while let Some(c1) = find_comma_simd(data, cma_ptr, leading)
             && let Some(c2) = find_newline_simd(data, nls_ptr, get!(cma_ptr) + 1)
         {
-            let mut next = 0;
             macro_rules! pipeline {
                 ($i:expr) => {{
                     let comma = get!(cma_ptr, $i);
-                    let city = mid_slice!(data, next, comma);
                     let newline = get!(nls_ptr, $i);
+                    let city = mid_slice!(data, leading, comma);
                     let value = mid_slice!(data, comma + 1, newline);
-                    next = newline + 1;
+                    leading = newline + 1;
                     (city.into(), parse_number(value))
                 }};
             }
@@ -1187,7 +1231,6 @@ mod bench {
                     1
                 }
             };
-            data = pst_slice!(data, next);
         }
         total
     }
