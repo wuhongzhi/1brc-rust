@@ -62,7 +62,7 @@ struct GenerateArg {
     size: u64,
 
     /// cities used for data file, max 10,000 cities
-    #[arg(short, long, default_value_t = 8_000, value_parser = max_cities)]
+    #[arg(short, long, default_value_t = 413, value_parser = max_cities)]
     cities: usize,
 
     /// template file
@@ -113,17 +113,24 @@ fn generate(argv: GenerateArg) -> Result<()> {
         file.read_to_string(&mut data)?;
         data
     };
-    let mut cities: Vec<(bench::City<'_>, bool)> = {
+    macro_rules! rand {
+        ($e:expr) => {
+            unsafe { libc::rand() } as usize % $e
+        };
+    }
+    let mut cities: Vec<(&str, bool)> = {
         let mut cities = HashSet::new();
         data.lines().for_each(|line| {
             if !line.starts_with("#")
                 && let Some(city) = line.split(";").next()
             {
-                cities.insert(bench::City::new(city.as_bytes()));
+                cities.insert(city);
             }
         });
+        let skip = rand!(cities.len() - argv.cities);
         cities
             .into_iter()
+            .skip(skip)
             .take(argv.cities)
             .map(|city| (city, false))
             .collect()
@@ -135,11 +142,6 @@ fn generate(argv: GenerateArg) -> Result<()> {
             .create(true)
             .truncate(true)
             .open(&argv.data)?;
-        macro_rules! rand {
-            ($e:expr) => {
-                unsafe { libc::rand() } as usize % $e
-            };
-        }
         macro_rules! lines {
             ($e:expr) => {
                 let bar = ProgressBar::new(argv.size);
@@ -158,7 +160,7 @@ fn generate(argv: GenerateArg) -> Result<()> {
                         if rand!(100) < 50 { "-" } else { "" },
                         rand!(1000) as f32 / 10f32,
                     );
-                    $e.write_all(&city.0)?;
+                    $e.write_all(city.0.as_bytes())?;
                     $e.write_all(temp.as_bytes())?;
                     if j % 10_000 == 0 && j != 0 {
                         bar.inc(10_000);
@@ -926,21 +928,25 @@ mod bench {
     const SIMD_SOLTS: usize = (size_of::<FindSimd>() as f32 / 7f32).ceil() as usize;
 
     const BASE_SIZE: usize = size_of::<FindBase>();
+    const BASE_MASK_CM: FindBase = FindBase::from_ne_bytes([CHR_CM; BASE_SIZE]);
+    const BASE_MASK_NL: FindBase = FindBase::from_ne_bytes([CHR_NL; BASE_SIZE]);
+    const BASE_MASK1: FindBase = FindBase::from_ne_bytes([0x01; BASE_SIZE]);
+    const BASE_MASK2: FindBase = FindBase::from_ne_bytes([0x80; BASE_SIZE]);
+
     const FIND_SIZE: usize = size_of::<FindSimd>();
-    const FIND_MASK1: FindSimd = FindSimd::splat(FindBase::from_ne_bytes([0x01; BASE_SIZE]));
-    const FIND_MASK2: FindSimd = FindSimd::splat(FindBase::from_ne_bytes([0x80; BASE_SIZE]));
+    const FIND_MASK_CM: FindSimd = FindSimd::splat(BASE_MASK_CM);
+    const FIND_MASK_NL: FindSimd = FindSimd::splat(BASE_MASK_NL);
+    const FIND_MASK1: FindSimd = FindSimd::splat(BASE_MASK1);
+    const FIND_MASK2: FindSimd = FindSimd::splat(BASE_MASK2);
 
     #[inline(always)]
     pub fn find_newline(data: &[u8]) -> Option<usize> {
-        const MASK: FindBase = FindBase::from_ne_bytes([CHR_NL; BASE_SIZE]);
-        const MASK1: FindBase = FindBase::from_ne_bytes([0x01; BASE_SIZE]);
-        const MASK2: FindBase = FindBase::from_ne_bytes([0x80; BASE_SIZE]);
         let (mut off, end) = (0, data.len());
         let ptr = data.as_ptr();
         // boost performance with swar
         for _ in 0..end / BASE_SIZE {
-            let mut value = read_unaligned!(ptr.add(off), FindBase) ^ MASK;
-            value = (value - MASK1) & !value & MASK2;
+            let mut value = read_unaligned!(ptr.add(off), FindBase) ^ BASE_MASK_NL;
+            value = (value - BASE_MASK1) & !value & BASE_MASK2;
             if value != 0 {
                 return Some(off + (value.trailing_zeros() >> 3) as usize);
             }
@@ -958,38 +964,41 @@ mod bench {
     //     cache: [usize; SIMD_SOLTS],
     //     cache_offset: usize,
     //     cache_length: usize,
-    //     data: &'a [u8],
+
+    //     data_ptr: *const u8,
+    //     data_length: usize,
     //     data_offset: usize,
     //     data_align: usize,
+
+    //     mask: &'a FindSimd,
     //     chr: u8,
-    //     mask: usize,
     // }
     // impl<'a> Tokenizer<'a> {
-    //     fn new(data: &'a [u8], chr: u8) -> Self {
+    //     fn new(data: &'a [u8], chr: u8, mask: &'a FindSimd) -> Self {
     //         Self {
-    //             data,
-    //             chr,
     //             cache: [0; SIMD_SOLTS],
     //             cache_length: 0,
     //             cache_offset: 0,
+    //             data_length: data.len(),
+    //             data_ptr: data.as_ptr(),
     //             data_offset: 0,
     //             data_align: 0,
-    //             mask: if chr == CHR_CM { 0 } else { 1 },
+    //             mask,
+    //             chr,
     //         }
     //         .align()
     //     }
 
     //     #[inline(always)]
     //     fn align(mut self) -> Self {
-    //         let end = self.data.len();
-    //         if self.data_offset < end {
-    //             self.data_align = match self.data.as_ptr().addr() % FIND_SIZE {
-    //                 0 => end / FIND_SIZE * FIND_SIZE,
+    //         if self.data_offset < self.data_length {
+    //             self.data_align = match self.data_ptr.addr() % FIND_SIZE {
+    //                 0 => self.data_length / FIND_SIZE * FIND_SIZE,
     //                 mut unaligned => {
     //                     let mut count = 0;
-    //                     unaligned = (FIND_SIZE - unaligned).min(end);
+    //                     unaligned = (FIND_SIZE - unaligned).min(self.data_length);
     //                     for i in 0..unaligned {
-    //                         if read_byte!(self.data.as_ptr(), i) == self.chr {
+    //                         if read_byte!(self.data_ptr, i) == self.chr {
     //                             set!(self.cache.as_mut_ptr(), count, i);
     //                             count += 1;
     //                         }
@@ -999,7 +1008,7 @@ mod bench {
     //                         self.cache_length = count;
     //                     }
     //                     self.data_offset = unaligned;
-    //                     (end - unaligned) / FIND_SIZE * FIND_SIZE
+    //                     (self.data_length - unaligned) / FIND_SIZE * FIND_SIZE
     //                 }
     //             };
     //         }
@@ -1008,10 +1017,6 @@ mod bench {
 
     //     #[inline(always)]
     //     fn fill(&mut self) -> bool {
-    //         const MASK: [FindSimd; 2] = [
-    //             FindSimd::splat(FindBase::from_ne_bytes([CHR_CM; BASE_SIZE])),
-    //             FindSimd::splat(FindBase::from_ne_bytes([CHR_NL; BASE_SIZE])),
-    //         ];
     //         let mut count = 0;
     //         macro_rules! check_result {
     //             ($delta:expr) => {
@@ -1024,8 +1029,8 @@ mod bench {
     //             };
     //         }
     //         while self.data_offset < self.data_align {
-    //             let mut value = get!(MASK.as_ptr(), self.mask)
-    //                 ^ get!(self.data.as_ptr().add(self.data_offset).cast::<FindSimd>());
+    //             let mut value =
+    //                 self.mask ^ get!(self.data_ptr.add(self.data_offset).cast::<FindSimd>());
     //             value = (value - FIND_MASK1) & !value & FIND_MASK2;
     //             let value = value.as_array();
     //             let mut off = self.data_offset;
@@ -1041,13 +1046,13 @@ mod bench {
     //             }
     //             check_result!(FIND_SIZE);
     //         }
-    //         for j in self.data_offset..self.data.len() {
-    //             if read_byte!(self.data.as_ptr(), j) == self.chr {
+    //         for j in self.data_offset..self.data_length {
+    //             if read_byte!(self.data_ptr, j) == self.chr {
     //                 set!(self.cache.as_mut_ptr(), count, j);
     //                 count += 1;
     //             }
     //         }
-    //         check_result!(self.data.len() - self.data_offset);
+    //         check_result!(self.data_length - self.data_offset);
     //         false
     //     }
 
@@ -1077,9 +1082,15 @@ mod bench {
 
     // #[allow(unused_unsafe)]
     // pub fn decode_lines<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
-    //     let mut commas = Tokenizer::new(data, CHR_CM);
-    //     let mut newlines = Tokenizer::new(data, CHR_NL);
+    //     let mut commas = Tokenizer::new(data, CHR_CM, &FIND_MASK_CM);
+    //     let mut newlines = Tokenizer::new(data, CHR_NL, &FIND_MASK_NL);
     //     let (mut leading, mut total) = (0, 0u64);
+    //     let data_ptr = data.as_ptr();
+    //     macro_rules! mid_slice {
+    //         ($d:expr, $s:expr, $e:expr) => {
+    //             unsafe { slice::from_raw_parts($d.add($s), $e - ($s)) }
+    //         };
+    //     }
     //     while let (mut comma, c1) = commas.next()
     //         && let (mut newline, c2) = newlines.next()
     //         && comma != 0
@@ -1087,8 +1098,8 @@ mod bench {
     //     {
     //         macro_rules! pipeline {
     //             ($comma:expr, $newline: expr) => {{
-    //                 let city = mid_slice!(data, leading, $comma);
-    //                 let value = mid_slice!(data, $comma + 1, $newline);
+    //                 let city = mid_slice!(data_ptr, leading, $comma);
+    //                 let value = mid_slice!(data_ptr, $comma + 1, $newline);
     //                 leading = $newline + 1;
     //                 (city.into(), parse_number(value))
     //             }};
@@ -1114,10 +1125,10 @@ mod bench {
     //             }};
     //         }
     //         total += match c2.min(c1) {
-    //             x if x > 2 => {
-    //                 repeat!(1 2 3);
-    //                 4
-    //             }
+    //             // x if x > 2 => {
+    //             //     repeat!(1 2 3);
+    //             //     4
+    //             // }
     //             x if x > 0 => {
     //                 repeat!(1);
     //                 2
@@ -1132,12 +1143,12 @@ mod bench {
     // }
 
     macro_rules! find_mask {
-        ($chr:expr, $data:expr, $pos_ptr:expr, $leading:expr) => {{
-            const MASK: FindSimd = FindSimd::splat(FindBase::from_ne_bytes([$chr; BASE_SIZE]));
-            let (mut count, mut leading, end) = (0, $leading, $data.len());
+        ($chr:expr, $mask: expr, $data_ptr:expr, $pos_ptr:expr, $leading:expr, $end: expr) => {{
+            const SHIFT: u32 = FIND_SIZE.ilog2() as u32;
+            let (mut count, mut leading) = (0, $leading);
             // boost performance with simd
-            for _ in 0..(end - leading) / FIND_SIZE {
-                let mut value = read_unaligned!($data.as_ptr().add(leading), FindSimd) ^ MASK;
+            for _ in 0..($end - leading) >> SHIFT {
+                let mut value = read_unaligned!($data_ptr.add(leading), FindSimd) ^ $mask;
                 value = (value - FIND_MASK1) & !value & FIND_MASK2;
                 let value = value.as_array();
                 let mut off = leading;
@@ -1156,8 +1167,8 @@ mod bench {
                     x => return Some(x),
                 }
             }
-            for j in leading..end {
-                if read_byte!($data.as_ptr(), j) == $chr {
+            for j in leading..$end {
+                if read_byte!($data_ptr, j) == $chr {
                     set!($pos_ptr, count, j);
                     count += 1;
                 }
@@ -1170,26 +1181,32 @@ mod bench {
     }
 
     macro_rules! define_find {
-        ($name:ident, $chr: ident) => {
+        ($name:ident, $chr: ident, $mask: ident) => {
             #[inline(always)]
             #[allow(unused_unsafe)]
-            pub fn $name(data: &[u8], pos_ptr: *mut usize, leading: usize) -> Option<usize> {
-                find_mask!($chr, data, pos_ptr, leading)
+            pub fn $name(
+                data_ptr: *const u8,
+                pos_ptr: *mut usize,
+                leading: usize,
+                end: usize,
+            ) -> Option<usize> {
+                find_mask!($chr, $mask, data_ptr, pos_ptr, leading, end)
             }
         };
     }
-    define_find!(find_comma_simd, CHR_CM);
-    define_find!(find_newline_simd, CHR_NL);
+    define_find!(find_comma_simd, CHR_CM, FIND_MASK_CM);
+    define_find!(find_newline_simd, CHR_NL, FIND_MASK_NL);
 
     #[allow(unused_unsafe)]
     pub fn decode_lines<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
         let mut commas = [0; SIMD_SOLTS];
         let mut newlns = [0; SIMD_SOLTS];
+        let (data_ptr, end) = (data.as_ptr(), data.len());
         let cma_ptr = commas.as_mut_ptr();
         let nls_ptr = newlns.as_mut_ptr();
         let (mut leading, mut total) = (0, 0u64);
-        while let Some(c1) = find_comma_simd(data, cma_ptr, leading)
-            && let Some(c2) = find_newline_simd(data, nls_ptr, get!(cma_ptr) + 1)
+        while let Some(c1) = find_comma_simd(data_ptr, cma_ptr, leading, end)
+            && let Some(c2) = find_newline_simd(data_ptr, nls_ptr, get!(cma_ptr) + 1, end)
         {
             macro_rules! pipeline {
                 ($i:expr) => {{
@@ -1218,10 +1235,10 @@ mod bench {
                 };
             }
             total += match c2.min(c1) {
-                x if x > 3 => {
-                    repeat!(0 1 2 3);
-                    4
-                }
+                // x if x > 3 => {
+                //     repeat!(0 1 2 3);
+                //     4
+                // }
                 x if x > 1 => {
                     repeat!(0 1);
                     2
