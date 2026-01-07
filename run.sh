@@ -1,5 +1,6 @@
 #!/bin/bash
 export RUSTFLAGS="-Ctarget-cpu=native"
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so.3
 cd $(dirname $0)
 if [ "$1" == "g" ]; then
     shift
@@ -7,18 +8,27 @@ if [ "$1" == "g" ]; then
 elif [ "$1" == 'd' ]; then    
     shift
     cargo run --release -- gen $@
-elif [ "$1" == 'b' ]; then
-    shift
-    export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so.3
-    for s in {1..5}; do
-       time ./target/release/rs_1brc bench $@ > /dev/null
-       sleep 1
-    done |& grep real | sed -e 's/real//' -e 's/s$//' -e 's/m/\*60+/' | \
-        bc | sort | head -n4 | tail -n3 | \
-        awk '{count+=$1} END{print count/NR}'
-elif [ "$1" == 'p' ]; then
-    shift
-    perf stat ./target/release/rs_1brc bench $@ > /dev/null
 else
-    time cargo run --release -- bench $@
-fi
+    target=""
+    if [ "$1" == 'x' ]; then
+        shift
+        target="x86_64-unknown-linux-musl"
+    fi
+    app="./target/${target}/release/rs_1brc"
+    if [ "$1" == 'b' ]; then
+        shift
+        for s in {1..11}; do
+            time $app bench $@ > /dev/null
+            sleep 1
+        done |& grep real | sed -e 's/real//' | sort | nl
+    elif [ "$1" == 'p' ]; then
+        shift
+        perf stat $app bench $@ > /dev/null
+    else
+        if [ -z "$target"]; then
+            time cargo run --release -- bench $@
+        else
+            time cargo run --release --target $target -- bench $@
+        fi
+    fi
+fi    
