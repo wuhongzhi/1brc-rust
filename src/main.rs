@@ -455,7 +455,6 @@ mod bench {
         fs::File,
         hash::{BuildHasher, Hash, Hasher},
         io::Write,
-        iter::FusedIterator,
         mem::ManuallyDrop,
         ops::{AddAssign, Deref},
         ptr::null,
@@ -466,13 +465,13 @@ mod bench {
 
     #[derive(Clone, Copy)]
     pub struct Weather {
-        min: i16,
-        max: i16,
+        min: isize,
+        max: isize,
         sum: i64,
         count: u64,
     }
     impl Weather {
-        fn new(value: i16) -> Self {
+        fn new(value: isize) -> Self {
             Self {
                 min: value,
                 max: value,
@@ -492,8 +491,8 @@ mod bench {
             buf.extend_from_slice((self.max as f64 / 10f64).format(1).as_bytes());
         }
     }
-    impl From<i16> for Weather {
-        fn from(value: i16) -> Self {
+    impl From<isize> for Weather {
+        fn from(value: isize) -> Self {
             Self::new(value)
         }
     }
@@ -545,9 +544,20 @@ mod bench {
     impl<'a> PartialEq for City<'a> {
         fn eq(&self, other: &Self) -> bool {
             // self.name.eq(other.name)
+            macro_rules! ne8 {
+                ($a:expr, $b: expr, $i: expr) => {
+                    read_byte!($a.as_ptr().add($i)) != read_byte!($b.as_ptr().add($i))
+                };
+            }
+            macro_rules! ne16 {
+                ($a:expr, $b: expr, $i: expr) => {
+                    read_unaligned!($a.as_ptr().add($i), u16)
+                        != read_unaligned!($b.as_ptr().add($i), u16)
+                };
+            }
             #[inline(always)]
             fn slow_loop(a: &[u8], b: &[u8]) -> bool {
-                (0..a.len()).all(|i| read_byte!(a.as_ptr(), i) == read_byte!(b.as_ptr(), i))
+                !(0..a.len()).any(|i| ne8!(a, b, i))
             }
             #[inline(always)]
             #[allow(unused_unsafe)]
@@ -600,9 +610,7 @@ mod bench {
             #[inline(always)]
             //fast detect first & last 2bytes base on the city statistics
             fn fast_detect(a: &[u8], b: &[u8]) -> bool {
-                read_byte!(a.as_ptr()) != read_byte!(b.as_ptr())
-                    || read_unaligned!(a.as_ptr().add(a.len() - 2), u16)
-                        != read_unaligned!(b.as_ptr().add(b.len() - 2), u16)
+                ne8!(a, b, 0) || ne16!(a, b, a.len() - 2)
             }
 
             let a = self.name;
@@ -713,8 +721,6 @@ mod bench {
         hasher: RandomState,
     }
 
-    const BITS_MASK: usize = (1 << RESULT_BITS) - 1;
-
     impl<'a> Default for MyWeatherMap<'a> {
         fn default() -> Self {
             MyWeatherMap {
@@ -766,16 +772,11 @@ mod bench {
             }
             None
         }
-        pub fn iter(self) -> WeatherIter<'a> {
-            WeatherIter {
-                pos: 0,
-                inner: self.inner,
-            }
-        }
 
         // TODO: refine this method
         #[inline(always)]
-        pub fn put<const MASK: usize>(&mut self, (key, value): (City<'a>, i16)) {
+        pub fn put(&mut self, (key, value): (City<'a>, isize)) {
+            const BUCKETS: usize = (1 << RESULT_BITS) - 1;
             #[inline(always)]
             fn index(index: u64) -> usize {
                 (/* index.rotate_right(RESULT_BITS * 4)
@@ -785,7 +786,7 @@ mod bench {
                     ^ index) as usize
             }
             let ptr = self.inner.as_mut_ptr();
-            let (mut miss, mut index) = (0, index(self.hasher.hash_one(key)) & MASK);
+            let (mut miss, mut index) = (0, index(self.hasher.hash_one(key)) & BUCKETS);
             loop {
                 match unsafe { &mut *ptr.add(index) } {
                     MyWeatherNode::Value((city, weather)) => {
@@ -797,10 +798,10 @@ mod bench {
                             break;
                         }
                         miss += 1;
-                        if miss == BITS_MASK {
+                        if miss == BUCKETS {
                             panic!("Map is full!");
                         }
-                        index = (index + 9337) & MASK;
+                        index = (index + 9337) & BUCKETS;
                     }
                     node => {
                         *node = MyWeatherNode::Value((key, value.into()));
@@ -810,24 +811,17 @@ mod bench {
             }
         }
     }
-    pub struct WeatherIter<'a> {
-        pos: usize,
-        inner: Vec<MyWeatherNode<'a>>,
-    }
-    impl<'a> FusedIterator for WeatherIter<'a> {}
-    impl<'a> Iterator for WeatherIter<'a> {
-        type Item = (City<'a>, Weather);
 
-        fn next(&mut self) -> Option<Self::Item> {
-            let ptr = self.inner.as_mut_ptr();
-            while self.pos < self.inner.len() {
-                if let MyWeatherNode::Value(x) = unsafe { &mut *ptr.add(self.pos) } {
-                    self.pos += 1;
-                    return Some(*x);
+    impl<'a> From<MyWeatherMap<'a>> for BTreeMap<City<'a>, Weather> {
+        fn from(mut val: MyWeatherMap<'a>) -> Self {
+            let mut r = BTreeMap::default();
+            let ptr = val.inner.as_mut_ptr();
+            for i in 0..val.inner.len() {
+                if let MyWeatherNode::Value((city, weather)) = get!(ptr, i) {
+                    r.insert(city, weather);
                 }
-                self.pos += 1;
             }
-            None
+            r
         }
     }
 
@@ -892,9 +886,7 @@ mod bench {
                         (clock.elapsed().unwrap().as_micros() as f64 / 1_000f64).format(3)
                     );
                 }
-                let mut result: BTreeMap<City<'_>, Weather> = BTreeMap::default();
-                result.extend(cities.iter());
-                (result, total)
+                (cities.into(), total)
             }
         }
         fn reduce<'a>(
@@ -906,7 +898,7 @@ mod bench {
                     .0
                     .entry(city)
                     .and_modify(|weather| *weather += value)
-                    .or_insert(value);
+                    .or_insert_with(|| value);
             });
             result.1 += cities.1;
             result
@@ -922,25 +914,24 @@ mod bench {
                 None => (1, 1 << 20),
             }
         };
-        let scanner = Scanner::new(
-            unsafe { slice::from_raw_parts(data.as_ptr(), data.len()) },
-            slice
-                .unwrap_or(data.len() / cpu_cores)
-                .max(cache_size / cpu_cores),
-        );
-        Ok(Reduce({
-            rayon::ThreadPoolBuilder::new()
-                .thread_name(|i| format!("decode-worker-{i}"))
-                .num_threads(cpu_cores)
-                .use_current_thread()
-                .build_global()?;
-            scanner
-                .par_bridge()
-                .into_par_iter()
-                .map(map(dry_run, slice.is_some()))
-                .reduce_with(reduce)
-                .unwrap()
-        }))
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("decode-worker-{i}"))
+            .num_threads(cpu_cores)
+            .use_current_thread()
+            .build_global()?;
+        Ok(Reduce(
+            Scanner::new(
+                unsafe { slice::from_raw_parts(data.as_ptr(), data.len()) },
+                slice
+                    .unwrap_or(data.len() / cpu_cores)
+                    .max(cache_size / cpu_cores),
+            )
+            .par_bridge()
+            .into_par_iter()
+            .map(map(dry_run, slice.is_some()))
+            .reduce_with(reduce)
+            .unwrap(),
+        ))
     }
 
     const CHR_NL: u8 = b'\n';
@@ -1013,14 +1004,16 @@ mod bench {
         }
         fn align(mut self) -> Self {
             const MASK: usize = FIND_SIZE - 1;
-            if self.data_ptr < self.data_end {
-                self.data_align = (self.data_end.addr() & !MASK) as *const u8;
-                let unaligned = self.data_ptr.addr() & MASK;
+            let data_ptr = self.data_ptr;
+            let data_end = self.data_end;
+            if data_ptr < data_end {
+                self.data_align = (data_end.addr() & !MASK) as *const u8;
+                let unaligned = data_ptr.addr() & MASK;
                 if unaligned != 0 {
                     self.fill_unaligned(unsafe {
-                        self.data_ptr.add(
-                            self.data_end
-                                .offset_from_unsigned(self.data_ptr)
+                        data_ptr.add(
+                            data_end
+                                .offset_from_unsigned(data_ptr)
                                 .min(FIND_SIZE - unaligned),
                         )
                     });
@@ -1072,7 +1065,6 @@ mod bench {
                 data_ptr = unsafe { data_ptr.add(FIND_SIZE) };
             }
             self.data_ptr = data_ptr;
-            self.cache_offset = 0;
             self.cache_length = cache_length;
             cache_length > 0 || self.fill_unaligned(self.data_end)
         }
@@ -1080,7 +1072,7 @@ mod bench {
         #[inline(always)]
         fn next(&mut self) -> *const u8 {
             let cache_offset = self.cache_offset;
-            if self.cache_length - cache_offset > 0 {
+            if self.cache_length > cache_offset {
                 self.cache_offset += 1;
                 get!(self.cache.as_ptr(), cache_offset)
             } else if self.fill() {
@@ -1108,27 +1100,32 @@ mod bench {
         }
 
         #[inline(always)]
-        fn next<F>(&mut self, f: F) -> bool
+        fn for_each<F>(&mut self, mut f: F)
         where
-            F: FnOnce((City<'a>, i16)),
+            F: FnMut((City<'a>, isize)),
         {
-            let comma = self.commas.next();
-            let newline = self.newlines.next();
-            if comma.is_null() || newline.is_null() {
-                false
-            } else {
-                macro_rules! mid_slice {
-                    ($s:expr, $e:expr) => {
-                        slice::from_raw_parts($s, $e.offset_from_unsigned($s))
-                    };
+            let commas = &mut self.commas;
+            let newlines = &mut self.newlines;
+            let mut leading = self.leading;
+            macro_rules! mid_slice {
+                ($s:expr, $e:expr) => {
+                    slice::from_raw_parts($s, $e.offset_from_unsigned($s))
+                };
+            }
+            loop {
+                let comma = commas.next();
+                let newline = newlines.next();
+                if !comma.is_null() && !newline.is_null() {
+                    unsafe {
+                        let city = mid_slice!(leading, comma);
+                        let value = mid_slice!(comma.add(1), newline);
+                        leading = newline.add(1);
+                        f((city.into(), parse_number(value)))
+                    }
+                    continue;
                 }
-                unsafe {
-                    let city = mid_slice!(self.leading, comma);
-                    let value = mid_slice!(comma.add(1), newline);
-                    self.leading = newline.add(1);
-                    f((city.into(), parse_number(value)))
-                }
-                true
+                self.leading = leading;
+                break;
             }
         }
     }
@@ -1136,13 +1133,12 @@ mod bench {
     #[allow(unused_unsafe)]
     pub fn decode_lines_a<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
         let mut total = 0;
-        let mut group = Group::new(data);
-        while group.next(|v| {
+        Group::new(data).for_each(|v| {
             total += 1;
             if !dry_run {
-                result.put::<BITS_MASK>(v)
+                result.put(v)
             }
-        }) {}
+        });
         total
     }
 
@@ -1230,7 +1226,7 @@ mod bench {
                     if !dry_run {
                     $(
                         concat_idents!(name = v, $i {
-                            result.put::<BITS_MASK>(name);
+                            result.put(name);
                         });
                     )*
                     }
@@ -1255,14 +1251,15 @@ mod bench {
     }
 
     #[inline(always)]
-    fn parse_number(value: &[u8]) -> i16 {
+    fn parse_number(value: &[u8]) -> isize {
         let p = value.as_ptr();
         // signal bit 001(0)1101 => `-`
         let s = ((!read_byte!(p) & 0x10) >> 4) as usize;
         // boost performance with swar
         let v = u32::from_be(read_unaligned!(p.add(s), u32) & 0x0F0F0F0F)
             >> ((s + 4 - value.len()) << 3);
-        (100 * (v >> 24) + 10 * ((v << 8) >> 24) + ((v << 24) >> 24)) as i16 * (1 - (s << 1) as i16)
+        (100 * (v >> 24) + 10 * ((v << 8) >> 24) + ((v << 24) >> 24)) as isize
+            * (1 - (s << 1) as isize)
     }
 
     #[cfg(test)]
