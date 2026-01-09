@@ -537,9 +537,10 @@ mod bench {
             match a.len() >> 4 {
                 0 => a.hash(state),
                 _ => {
-                    let ptr = a.as_ptr();
+                    let mut ptr = a.as_ptr();
                     read_unaligned!(ptr, u64).hash(state);
-                    read_unaligned!(ptr.add(a.len() - 8), u64).hash(state);
+                    ptr = (ptr as usize + a.len() - 8) as *const u8;
+                    read_unaligned!(ptr, u64).hash(state);
                 }
             }
         }
@@ -813,8 +814,9 @@ mod bench {
                     ^ (index >> RESULT_BITS)
                     ^ index) as usize
             }
+            let hash_code = { self.hasher.hash_one(key) };
             let ptr = self.inner.as_mut_ptr();
-            let (mut miss, mut index) = (0, index(self.hasher.hash_one(key)) & BUCKETS);
+            let (mut miss, mut index) = (0, index(hash_code) & BUCKETS);
             loop {
                 return match get_mut!(ptr, index) {
                     MyWeatherNode::Value((city, weather)) => {
@@ -1291,12 +1293,12 @@ mod bench {
 
     #[inline(always)]
     fn parse_number(value: &[u8]) -> isize {
-        let p = value.as_ptr();
+        let mut p = value.as_ptr();
         // signal bit 001(0)1101 => `-`
         let s = ((!read_byte!(p) & 0x10) >> 4) as usize;
         // boost performance with swar
-        let v = u32::from_be(read_unaligned!(p.add(s), u32) & 0x0F0F0F0F)
-            >> ((s + 4 - value.len()) << 3);
+        p = (p as usize + s) as *const u8;
+        let v = u32::from_be(read_unaligned!(p, u32) & 0x0F0F0F0F) >> ((s + 4 - value.len()) << 3);
         (100 * (v >> 24) + 10 * ((v << 8) >> 24) + ((v << 24) >> 24)) as isize
             * (1 - (s << 1) as isize)
     }
