@@ -627,9 +627,9 @@ mod bench {
                             if !(x & 0x1 == 1 && ne_u64!(a, b, len)
                                 || x != 1 && {
                                     let y = x >> 1;
-                                    y & 0x1 == 1 && simd_ne!(16, a, b, ((y >> 1) & 0x01) << 5)
+                                    let z = y >> 1;
+                                    y & 0x1 == 1 && simd_ne!(16, a, b, (z & 0x01) << 5)
                                         || y != 1 && {
-                                            let z = y >> 1;
                                             z == 1 && simd_ne!(32, a, b)
                                                 || z >= 2 && simd_ne!(64, a, b)
                                         }
