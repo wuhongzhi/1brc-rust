@@ -624,7 +624,7 @@ mod bench {
                         }
                         mut x => {
                             len -= 8;
-                            if x & 0x1 == 1 && ne_u64!(a, b, len)
+                            if !(x & 0x1 == 1 && ne_u64!(a, b, len)
                                 || x != 1 && {
                                     let y = x >> 1;
                                     y & 0x1 == 1 && simd_ne!(16, a, b, ((y >> 1) & 0x01) << 5)
@@ -633,14 +633,14 @@ mod bench {
                                             z == 1 && simd_ne!(32, a, b)
                                                 || z >= 2 && simd_ne!(64, a, b)
                                         }
-                                }
+                                })
                             {
-                                return false;
+                                x <<= 3;
+                                a = pst_slice!(a, x);
+                                b = pst_slice!(b, x);
+                                continue;
                             }
-                            x <<= 3;
-                            a = pst_slice!(a, x);
-                            b = pst_slice!(b, x);
-                            continue;
+                            false
                         }
                     };
                 }
