@@ -1153,24 +1153,24 @@ mod bench {
                 };
             }
             let mut total = 0;
+            macro_rules! null_check {
+                ($e:expr) => {{
+                    if $e.is_null() {
+                        break total;
+                    }
+                    $e
+                }};
+            }
             loop {
                 let mut comma = commas.next();
-                let city = {
-                    if comma.is_null() {
-                        break total;
-                    }
-                    mid_slice!(newline, comma)
-                };
+                let city = { mid_slice!(newline, null_check!(comma)) };
                 let value = {
-                    newline = newlines.next();
-                    if newline.is_null() {
-                        break total;
-                    }
                     comma = unsafe { offset!(comma, 1) };
-                    mid_slice!(comma, newline)
+                    newline = newlines.next();
+                    mid_slice!(comma, null_check!(newline))
                 };
-                f((city.into(), parse_number(value)));
                 newline = unsafe { offset!(newline, 1) };
+                f((city.into(), parse_number(value)));
                 total += 1;
             }
         }
@@ -1179,9 +1179,15 @@ mod bench {
     pub fn decode_lines_a<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
         let mut group = Group::new(data);
         if dry_run {
-            group.for_each(|_| {})
+            group.for_each(
+                #[inline(always)]
+                |_| {},
+            )
         } else {
-            group.for_each(|v| result.put(v))
+            group.for_each(
+                #[inline(always)]
+                move |v| result.put(v),
+            )
         }
     }
 
@@ -1393,9 +1399,9 @@ mod bench {
         #[ignore]
         fn bench_reduce(b: &mut test::Bencher) {
             let data = Mmap::open::<false>(File::open("./data/measurements.txt").unwrap()).unwrap();
+            let mut m = WeatherMap::default();
             b.iter(|| {
-                let mut m = WeatherMap::default();
-                decode_lines(&data, &mut m, false);
+                decode_lines(&data, m.reset(), false);
             });
         }
     }
