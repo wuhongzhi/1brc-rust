@@ -17,6 +17,16 @@ use std::{
     time::SystemTime,
 };
 
+macro_rules! ptr_add {
+    ($e: expr, $i: expr) => {
+        ($e as usize + $i) as *const u8
+    };
+}
+macro_rules! offset {
+    ($e:expr, $i:expr) => {
+        $e.add($i)
+    };
+}
 macro_rules! pre_slice {
     ($d:expr, $i:expr) => {
         unsafe { slice::from_raw_parts($d.as_ptr(), $i) }
@@ -27,21 +37,13 @@ macro_rules! pst_slice {
         unsafe {
             let off = $i;
             let len = $d.len() - off;
-            slice::from_raw_parts($d.as_ptr().add(off), len)
+            slice::from_raw_parts(offset!($d.as_ptr(), off), len)
         }
     };
 }
 macro_rules! mid_slice {
     ($d:expr, $s:expr, $e:expr) => {
-        unsafe { slice::from_raw_parts($d.as_ptr().add($s), $e - ($s)) }
-    };
-}
-macro_rules! read_byte {
-    ($e:expr) => {
-        unsafe { $e.read() }
-    };
-    ($e:expr, $i:expr) => {
-        unsafe { $e.add($i).read() }
+        unsafe { slice::from_raw_parts(offset!($d.as_ptr(), $s), $e - ($s)) }
     };
 }
 const RESULT_BITS: u32 = 16;
@@ -497,6 +499,7 @@ mod bench {
         }
     }
     impl AddAssign for Weather {
+        #[inline(always)]
         fn add_assign(&mut self, other: Self) {
             self.sum += other.sum;
             self.count += other.count;
@@ -506,6 +509,32 @@ mod bench {
                 self.min = other.min;
             }
         }
+    }
+    impl AddAssign<isize> for Weather {
+        #[inline(always)]
+        fn add_assign(&mut self, value: isize) {
+            self.sum += value as i64;
+            self.count += 1;
+            if value > self.max {
+                self.max = value;
+            } else if value < self.min {
+                self.min = value;
+            }
+        }
+    }
+
+    macro_rules! get {
+        ($v:expr) => {
+            unsafe { *$v }
+        };
+        ($v:expr, $i:expr) => {
+            unsafe { *offset!($v, $i) }
+        };
+    }
+    macro_rules! get_mut {
+        ($v:expr, $i:expr) => {
+            unsafe { &mut *offset!($v, $i) }
+        };
     }
     macro_rules! read_unaligned {
         ($p:expr, $ty:ty) => {
@@ -539,7 +568,7 @@ mod bench {
                 _ => {
                     let mut ptr = a.as_ptr();
                     read_unaligned!(ptr, u64).hash(state);
-                    ptr = (ptr as usize + a.len() - 8) as *const u8;
+                    ptr = ptr_add!(ptr, a.len() - 8);
                     read_unaligned!(ptr, u64).hash(state);
                 }
             }
@@ -550,10 +579,10 @@ mod bench {
             // self.name.eq(other.name)
             macro_rules! ne_u8 {
                 ($a:expr, $b: expr) => {
-                    read_byte!($a.as_ptr()) != read_byte!($b.as_ptr())
+                    get!($a.as_ptr()) != get!($b.as_ptr())
                 };
                 ($a:expr, $b: expr, $i: expr) => {
-                    read_byte!($a.as_ptr().add($i)) != read_byte!($b.as_ptr().add($i))
+                    get!(offset!($a.as_ptr(), $i)) != get!(offset!($b.as_ptr(), $i))
                 };
             }
             macro_rules! ne_u16 {
@@ -561,8 +590,8 @@ mod bench {
                     read_unaligned!($a.as_ptr(), u16) != read_unaligned!($b.as_ptr(), u16)
                 };
                 ($a:expr, $b: expr, $i: expr) => {
-                    read_unaligned!($a.as_ptr().add($i), u16)
-                        != read_unaligned!($b.as_ptr().add($i), u16)
+                    read_unaligned!(offset!($a.as_ptr(), $i), u16)
+                        != read_unaligned!(offset!($b.as_ptr(), $i), u16)
                 };
             }
             #[inline(always)]
@@ -574,14 +603,14 @@ mod bench {
                             != u8x4::from_slice(pst_slice!($b, len - 4))
                     };
                 }
-                match len >> 2 {
-                    1 if ne_u8x4!(a, b) => false,
-                    _ => match len & 0x03 {
-                        1 => !ne_u8!(a, b),
-                        2 => !ne_u16!(a, b),
-                        3 => !ne_u8!(a, b) && !ne_u16!(a, b, 1),
-                        _ => true,
-                    },
+                if len > 4 && ne_u8x4!(a, b) {
+                    return false;
+                }
+                match len & 0x03 {
+                    1 => !ne_u8!(a, b),
+                    2 => !ne_u16!(a, b),
+                    3 => !ne_u8!(a, b) && !ne_u16!(a, b, 1),
+                    _ => true,
                 }
             }
             #[inline(always)]
@@ -762,20 +791,7 @@ mod bench {
             unsafe { *$v = $r };
         };
         ($v:expr, $i:expr, $r:expr) => {
-            unsafe { *$v.add($i) = $r };
-        };
-    }
-    macro_rules! get {
-        ($v:expr) => {
-            unsafe { *$v }
-        };
-        ($v:expr, $i:expr) => {
-            unsafe { *$v.add($i) }
-        };
-    }
-    macro_rules! get_mut {
-        ($v:expr, $i:expr) => {
-            unsafe { &mut *$v.add($i) }
+            unsafe { *offset!($v, $i) = $r };
         };
     }
     #[allow(dead_code)]
@@ -805,7 +821,6 @@ mod bench {
         // TODO: refine this method
         #[inline(always)]
         pub fn put(&mut self, (key, value): (City<'a>, isize)) {
-            const BUCKETS: usize = (1 << RESULT_BITS) - 1;
             #[inline(always)]
             fn index(index: u64) -> usize {
                 (/* index.rotate_right(RESULT_BITS * 4)
@@ -814,6 +829,7 @@ mod bench {
                     ^ (index >> RESULT_BITS)
                     ^ index) as usize
             }
+            const BUCKETS: usize = (1 << RESULT_BITS) - 1;
             let hash_code = { self.hasher.hash_one(key) };
             let ptr = self.inner.as_mut_ptr();
             let (mut miss, mut index) = (0, index(hash_code) & BUCKETS);
@@ -828,13 +844,7 @@ mod bench {
                             }
                             panic!("Map is full!");
                         }
-                        weather.count += 1;
-                        weather.sum += value as i64;
-                        if value > weather.max {
-                            weather.max = value;
-                        } else if value < weather.min {
-                            weather.min = value;
-                        }
+                        *weather += value;
                     }
                     node => {
                         *node = MyWeatherNode::Value((key, value.into()));
@@ -923,18 +933,16 @@ mod bench {
             }
         }
         fn reduce<'a>(
-            mut result: (BTreeMap<City<'a>, Weather>, u64),
-            cities: (BTreeMap<City<'a>, Weather>, u64),
+            (mut result, c1): (BTreeMap<City<'a>, Weather>, u64),
+            (batch, c2): (BTreeMap<City<'a>, Weather>, u64),
         ) -> (BTreeMap<City<'a>, Weather>, u64) {
-            cities.0.into_iter().for_each(|(city, value)| {
+            batch.into_iter().for_each(|(city, value)| {
                 result
-                    .0
                     .entry(city)
                     .and_modify(|weather| *weather += value)
                     .or_insert_with(|| value);
             });
-            result.1 += cities.1;
-            result
+            (result, c1 + c2)
         }
 
         let (cpu_cores, cache_size) = {
@@ -993,7 +1001,7 @@ mod bench {
         let ptr = data.as_ptr();
         // boost performance with swar
         for _ in 0..end >> SHIFT {
-            let mut value = read_unaligned!(ptr.add(off), FindBase) ^ BASE_MASK_NL;
+            let mut value = read_unaligned!(offset!(ptr, off), FindBase) ^ BASE_MASK_NL;
             value = (value - BASE_MASK1) & !value & BASE_MASK2;
             if value != 0 {
                 return Some(off + (value.trailing_zeros() >> 3) as usize);
@@ -1001,7 +1009,7 @@ mod bench {
             off += BASE_SIZE;
         }
         for j in off..end {
-            if read_byte!(ptr, j) == CHR_NL {
+            if get!(ptr, j) == CHR_NL {
                 return Some(j);
             }
         }
@@ -1027,7 +1035,7 @@ mod bench {
                 cache: [null(); SIMD_SOLTS],
                 cache_offset: 0,
                 cache_length: 0,
-                data_end: unsafe { data_ptr.add(data.len()) },
+                data_end: unsafe { offset!(data_ptr, data.len()) },
                 data_align: data_ptr,
                 data_ptr,
                 mask,
@@ -1044,10 +1052,11 @@ mod bench {
                 let unaligned = data_ptr.addr() & MASK;
                 if unaligned != 0 {
                     self.fill_unaligned(unsafe {
-                        data_ptr.add(
+                        offset!(
+                            data_ptr,
                             data_end
                                 .offset_from_unsigned(data_ptr)
-                                .min(FIND_SIZE - unaligned),
+                                .min(FIND_SIZE - unaligned)
                         )
                     });
                 };
@@ -1060,11 +1069,11 @@ mod bench {
             let cache_ptr = self.cache.as_mut_ptr();
             let chr = self.chr;
             while data_ptr < unaligned {
-                if read_byte!(data_ptr) == chr {
+                if get!(data_ptr) == chr {
                     set!(cache_ptr, cache_length, data_ptr);
                     cache_length += 1;
                 }
-                data_ptr = (data_ptr as usize + 1) as *const u8;
+                data_ptr = ptr_add!(data_ptr, 1);
             }
             self.cache_length = cache_length;
             self.data_ptr = data_ptr;
@@ -1082,22 +1091,18 @@ mod bench {
                 let mut value = mask ^ get!(data_ptr.cast::<FindSimd>());
                 value = (value - FIND_MASK1) & !value & FIND_MASK2;
                 let value = value.as_array();
-                let mut off = data_ptr as usize;
+                let mut off = data_ptr;
                 for j in 0..TIMES {
                     let mut x = get!(value.as_ptr(), j);
                     while x != 0 {
                         let v = x.trailing_zeros();
-                        set!(
-                            cache_ptr,
-                            cache_length,
-                            (off + (v >> 3) as usize) as *const u8
-                        );
+                        set!(cache_ptr, cache_length, ptr_add!(off, (v >> 3) as usize));
                         cache_length += 1;
                         x ^= 1 << v;
                     }
-                    off += BASE_SIZE;
+                    off = ptr_add!(off, BASE_SIZE);
                 }
-                data_ptr = (data_ptr as usize + FIND_SIZE) as *const u8;
+                data_ptr = ptr_add!(data_ptr, FIND_SIZE);
             }
             self.data_ptr = data_ptr;
             self.cache_length = cache_length;
@@ -1161,11 +1166,11 @@ mod bench {
                     if newline.is_null() {
                         break total;
                     }
-                    comma = unsafe { comma.add(1) };
+                    comma = unsafe { offset!(comma, 1) };
                     mid_slice!(comma, newline)
                 };
                 f((city.into(), parse_number(value)));
-                newline = unsafe { newline.add(1) };
+                newline = unsafe { offset!(newline, 1) };
                 total += 1;
             }
         }
@@ -1187,7 +1192,7 @@ mod bench {
             let mut count = 0;
             // boost performance with simd
             for _ in 0..($end - $leading) >> SHIFT {
-                let mut value = read_unaligned!($data_ptr.add($leading), FindSimd) ^ $mask;
+                let mut value = read_unaligned!(offset!($data_ptr, $leading), FindSimd) ^ $mask;
                 value = (value - FIND_MASK1) & !value & FIND_MASK2;
                 let value = value.as_array();
                 let mut off = $leading;
@@ -1207,7 +1212,7 @@ mod bench {
                 $leading += FIND_SIZE;
             }
             for j in $leading..$end {
-                if read_byte!($data_ptr, j) == $chr {
+                if get!($data_ptr, j) == $chr {
                     set!($pos_ptr, count, j);
                     count += 1;
                 }
@@ -1244,22 +1249,18 @@ mod bench {
         macro_rules! decode_lines {
             () => {{
                 loop {
-                    let c1 = find_comma_simd(data_ptr, cma_ptr, leading, end);
-                    let c2 = find_newline_simd(data_ptr, nls_ptr, get!(cma_ptr) + 1, end);
-                    total += match c2.min(c1) {
-                        // x if x > 3 => {
-                        //     repeat!(0 1 2 3);
-                        //     4
-                        // }
-                        x if x > 1 => {
-                            repeat!(0 1);
-                            2
-                        }
+                    let mut avriable = find_comma_simd(data_ptr, cma_ptr, leading, end);
+                    avriable = find_newline_simd(data_ptr, nls_ptr, get!(cma_ptr) + 1, end).min(avriable);
+                    total += match avriable {
+                        0 => break total,
                         1 => {
                             repeat!(0);
                             1
                         }
-                        _ => break total
+                        _ => {
+                            repeat!(0 1);
+                            2
+                        }
                     };
                 }
             }};
@@ -1293,12 +1294,12 @@ mod bench {
 
     #[inline(always)]
     fn parse_number(value: &[u8]) -> isize {
-        let mut p = value.as_ptr();
+        let p = value.as_ptr();
         // signal bit 001(0)1101 => `-`
-        let s = ((!read_byte!(p) & 0x10) >> 4) as usize;
+        let s = ((!get!(p) & 0x10) >> 4) as usize;
+        let l = (s + 4 - value.len()) << 3;
         // boost performance with swar
-        p = (p as usize + s) as *const u8;
-        let v = u32::from_be(read_unaligned!(p, u32) & 0x0F0F0F0F) >> ((s + 4 - value.len()) << 3);
+        let v = u32::from_be(read_unaligned!(ptr_add!(p, s), u32) & 0x0F0F0F0F) >> l;
         (100 * (v >> 24) + 10 * ((v << 8) >> 24) + ((v << 24) >> 24)) as isize
             * (1 - (s << 1) as isize)
     }
