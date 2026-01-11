@@ -460,7 +460,7 @@ mod bench {
         mem::ManuallyDrop,
         ops::{AddAssign, Deref},
         ptr::null,
-        simd::{u8x8, u16x8, u32x8, u64x8},
+        simd::{u16x8, u32x8, u64x8},
         thread,
         time::SystemTime,
     };
@@ -577,36 +577,18 @@ mod bench {
     impl<'a> PartialEq for City<'a> {
         fn eq(&self, other: &Self) -> bool {
             // self.name.eq(other.name)
-            macro_rules! ne_u8 {
-                ($a:expr, $b: expr) => {
-                    get!($a.as_ptr()) != get!($b.as_ptr())
-                };
-                ($a:expr, $b: expr, $i: expr) => {
-                    get!(offset!($a.as_ptr(), $i)) != get!(offset!($b.as_ptr(), $i))
-                };
-            }
-            macro_rules! ne_u16 {
-                ($a:expr, $b: expr) => {
-                    read_unaligned!($a.as_ptr(), u16) != read_unaligned!($b.as_ptr(), u16)
-                };
-                ($a:expr, $b: expr, $i: expr) => {
-                    read_unaligned!(offset!($a.as_ptr(), $i), u16)
-                        != read_unaligned!(offset!($b.as_ptr(), $i), u16)
-                };
-            }
-            #[inline(always)]
-            fn part_compare(a: &[u8], b: &[u8]) -> bool {
-                let len = (8 - a.len()) << 3;
-                u64::from_le(read_unaligned!(a.as_ptr(), u64)) << len
-                    == u64::from_le(read_unaligned!(b.as_ptr(), u64)) << len
-            }
             #[inline(always)]
             #[allow(unused_unsafe)]
-            fn simd_compare(mut a: &[u8], mut b: &[u8]) -> bool {
+            fn simd_compare((mut a, mut b): (&[u8], &[u8])) -> bool {
                 macro_rules! cast_x8 {
                     ($ty:expr, $e: expr) => {
                         concat_idents!(ty = u, $ty {
                             unsafe { slice::from_raw_parts::<ty>($e.as_ptr().cast(), 8) }
+                        })
+                    };
+                    ($ty:expr, $e: expr, $i:expr) => {
+                        concat_idents!(ty = u, $ty {
+                            unsafe { slice::from_raw_parts::<ty>(offset!($e.as_ptr(), $i).cast(), 8) }
                         })
                     };
                 }
@@ -617,31 +599,41 @@ mod bench {
                                 != <simd>::from_slice(cast_x8!($w, $b))
                         })
                     };
-                    ($c:expr, $d:expr, $a:expr, $b:expr) => {
-                        simd_ne!($c, $a, $b)
-                            || simd_ne!($d, pst_slice!($a, $c), pst_slice!($b, $c))
-                    };
-                    ($c:expr, $d:expr, $e:expr, $a:expr, $b:expr) => {
-                        simd_ne!($c, $d, $a, $b)
-                            || simd_ne!(
-                                $e,
-                                pst_slice!($a, $c + $d),
-                                pst_slice!($b, $c + $d)
-                            )
+                    ($w:expr, $a:expr, $b:expr, $i:expr) => {
+                        concat_idents!(simd = u, $w, x8 {
+                            <simd>::from_slice(cast_x8!($w, $a, $i))
+                                != <simd>::from_slice(cast_x8!($w, $b, $i))
+                        })
                     };
                 }
+                macro_rules! ne_u64 {
+                    ($a:expr, $b: expr, $len:expr) => {{
+                        read_unaligned!(offset!($a.as_ptr(), $len), u64)
+                            != read_unaligned!(offset!($b.as_ptr(), $len), u64)
+                    }};
+                }
                 loop {
-                    return match a.len() >> 3 {
-                        0 => a.is_empty() || part_compare(a, b),
+                    let mut len = a.len();
+                    return match len >> 3 {
+                        0 => {
+                            a.is_empty() || {
+                                let x = (8 - len) << 3;
+                                u64::from_le(read_unaligned!(a.as_ptr(), u64)) << x
+                                    == u64::from_le(read_unaligned!(b.as_ptr(), u64)) << x
+                            }
+                        }
                         mut x => {
-                            if x == 1 && simd_ne!(8, a, b)
-                                || x == 2 && simd_ne!(16, a, b)
-                                || x == 3 && simd_ne!(16, 8, a, b)
-                                || x == 4 && simd_ne!(32, a, b)
-                                || x == 5 && simd_ne!(32, 8, a, b)
-                                || x == 6 && simd_ne!(32, 16, a, b)
-                                || x == 7 && simd_ne!(32, 16, 8, a, b)
-                                || x >= 8 && simd_ne!(64, a, b)
+                            len -= 8;
+                            if x & 0x1 == 1 && ne_u64!(a, b, len)
+                                || x != 1 && {
+                                    let y = x >> 1;
+                                    y & 0x1 == 1 && simd_ne!(16, a, b, ((y >> 1) & 0x01) << 5)
+                                        || y != 1 && {
+                                            let z = y >> 1;
+                                            z == 1 && simd_ne!(32, a, b)
+                                                || z >= 2 && simd_ne!(64, a, b)
+                                        }
+                                }
                             {
                                 return false;
                             }
@@ -656,13 +648,17 @@ mod bench {
 
             #[inline(always)]
             //fast detect first & last 2bytes base on the city statistics
-            fn fast_detect(a: &[u8], b: &[u8]) -> bool {
-                a.len() != b.len() || ne_u8!(a, b, 0) || ne_u16!(a, b, a.len() - 2)
+            fn fast_detect((a, b): (&[u8], &[u8])) -> bool {
+                let mut len = a.len();
+                len == b.len() && get!(a.as_ptr()) == get!(b.as_ptr()) && {
+                    len -= 2;
+                    read_unaligned!(offset!(a.as_ptr(), len), u16)
+                        == read_unaligned!(offset!(b.as_ptr(), len), u16)
+                }
             }
 
-            let a = self.name;
-            let b = other.name;
-            !fast_detect(a, b) || simd_compare(a, b)
+            let v = (self.name, other.name);
+            fast_detect(v) && simd_compare(v)
         }
     }
     impl<'a> Deref for City<'a> {
