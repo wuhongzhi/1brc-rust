@@ -460,7 +460,7 @@ mod bench {
         mem::ManuallyDrop,
         ops::{AddAssign, Deref},
         ptr::null,
-        simd::{u8x4, u8x8, u16x8, u32x8, u64x8},
+        simd::{u8x8, u16x8, u32x8, u64x8},
         thread,
         time::SystemTime,
     };
@@ -595,27 +595,14 @@ mod bench {
                 };
             }
             #[inline(always)]
-            fn slow_loop(a: &[u8], b: &[u8]) -> bool {
-                let len = a.len();
-                macro_rules! ne_u8x4 {
-                    ($a:expr, $b: expr) => {
-                        u8x4::from_slice(pst_slice!($a, len - 4))
-                            != u8x4::from_slice(pst_slice!($b, len - 4))
-                    };
-                }
-                if len > 4 && ne_u8x4!(a, b) {
-                    return false;
-                }
-                match len & 0x03 {
-                    1 => !ne_u8!(a, b),
-                    2 => !ne_u16!(a, b),
-                    3 => !ne_u8!(a, b) && !ne_u16!(a, b, 1),
-                    _ => true,
-                }
+            fn part_compare(a: &[u8], b: &[u8]) -> bool {
+                let len = (8 - a.len()) << 3;
+                u64::from_le(read_unaligned!(a.as_ptr(), u64)) << len
+                    == u64::from_le(read_unaligned!(b.as_ptr(), u64)) << len
             }
             #[inline(always)]
             #[allow(unused_unsafe)]
-            fn fast_simd(mut a: &[u8], mut b: &[u8]) -> bool {
+            fn simd_compare(mut a: &[u8], mut b: &[u8]) -> bool {
                 macro_rules! cast_x8 {
                     ($ty:expr, $e: expr) => {
                         concat_idents!(ty = u, $ty {
@@ -645,7 +632,7 @@ mod bench {
                 }
                 loop {
                     return match a.len() >> 3 {
-                        0 => a.is_empty() || slow_loop(a, b),
+                        0 => a.is_empty() || part_compare(a, b),
                         mut x => {
                             if x == 1 && simd_ne!(8, a, b)
                                 || x == 2 && simd_ne!(16, a, b)
@@ -675,11 +662,7 @@ mod bench {
 
             let a = self.name;
             let b = other.name;
-            if fast_detect(a, b) {
-                false
-            } else {
-                fast_simd(a, b)
-            }
+            !fast_detect(a, b) || simd_compare(a, b)
         }
     }
     impl<'a> Deref for City<'a> {
@@ -1246,55 +1229,60 @@ mod bench {
 
     #[allow(unused_unsafe)]
     pub fn decode_lines_b<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
-        let mut commas = [0; SIMD_SOLTS];
-        let mut newlns = [0; SIMD_SOLTS];
-        let cma_ptr = commas.as_mut_ptr();
-        let nls_ptr = newlns.as_mut_ptr();
-        let (mut leading, mut total) = (0, 0u64);
-        let (data_ptr, end) = (data.as_ptr(), data.len());
-        macro_rules! decode_lines {
-            () => {{
-                loop {
-                    let mut avriable = find_comma_simd(data_ptr, cma_ptr, leading, end);
-                    avriable = find_newline_simd(data_ptr, nls_ptr, get!(cma_ptr) + 1, end).min(avriable);
-                    total += match avriable {
-                        0 => break total,
-                        1 => {
-                            repeat!(0);
-                            1
-                        }
-                        _ => {
-                            repeat!(0 1);
-                            2
-                        }
-                    };
-                }
-            }};
-        }
-        macro_rules! pipeline {
-            ($i:expr) => {{
-                let comma = get!(cma_ptr, $i);
-                let newline = get!(nls_ptr, $i);
-                let city = mid_slice!(data, leading, comma);
-                let value = mid_slice!(data, comma + 1, newline);
-                leading = newline + 1;
-                (city.into(), parse_number(value))
-            }};
+        fn for_each<'a, F>(data: &'a [u8], mut f: F) -> u64
+        where
+            F: FnMut((City<'a>, isize)),
+        {
+            let mut commas = [0; SIMD_SOLTS];
+            let mut newlns = [0; SIMD_SOLTS];
+            let cma_ptr = commas.as_mut_ptr();
+            let nls_ptr = newlns.as_mut_ptr();
+            let (mut leading, mut total) = (0, 0u64);
+            let (data_ptr, end) = (data.as_ptr(), data.len());
+            macro_rules! pipeline {
+                ($i:expr) => {{
+                    let comma = get!(cma_ptr, $i);
+                    let newline = get!(nls_ptr, $i);
+                    let city = mid_slice!(data, leading, comma);
+                    let value = mid_slice!(data, comma + 1, newline);
+                    leading = newline + 1;
+                    f((city.into(), parse_number(value)))
+                }};
+            }
+            macro_rules! repeat {
+                ($($i:expr)*) => {
+                    $(pipeline!($i);)*
+                };
+            }
+            loop {
+                let mut avriable = find_comma_simd(data_ptr, cma_ptr, leading, end);
+                avriable =
+                    find_newline_simd(data_ptr, nls_ptr, get!(cma_ptr) + 1, end).min(avriable);
+                total += match avriable {
+                    0 => break total,
+                    1 => {
+                        repeat!(0);
+                        1
+                    }
+                    _ => {
+                        repeat!(0 1);
+                        2
+                    }
+                };
+            }
         }
         if dry_run {
-            macro_rules! repeat {
-                ($($i:expr)*) => {
-                    $(let _: (City<'_>, isize) = pipeline!($i);)*
-                };
-            }
-            decode_lines!()
+            for_each(
+                data,
+                #[inline(always)]
+                |_| {},
+            )
         } else {
-            macro_rules! repeat {
-                ($($i:expr)*) => {
-                    $(result.put(pipeline!($i));)*
-                };
-            }
-            decode_lines!()
+            for_each(
+                data,
+                #[inline(always)]
+                |v| result.put(v),
+            )
         }
     }
 
