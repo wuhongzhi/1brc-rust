@@ -37,13 +37,13 @@ macro_rules! pst_slice {
         unsafe {
             let off = $i;
             let len = $d.len() - off;
-            slice::from_raw_parts(offset!($d.as_ptr(), off), len)
+            slice::from_raw_parts(ptr_add!($d.as_ptr(), off), len)
         }
     };
 }
 macro_rules! mid_slice {
     ($d:expr, $s:expr, $e:expr) => {
-        unsafe { slice::from_raw_parts(offset!($d.as_ptr(), $s), $e - ($s)) }
+        unsafe { slice::from_raw_parts(ptr_add!($d.as_ptr(), $s), $e - ($s)) }
     };
 }
 const RESULT_BITS: u32 = 16;
@@ -449,13 +449,11 @@ mod bench {
     use concat_idents::concat_idents;
     use core::slice;
     use proc_cpuinfo::CpuInfo;
-    use rapidhash::fast::RandomState;
     use rayon::prelude::*;
     use std::{
         collections::BTreeMap,
         fmt::Display,
         fs::File,
-        hash::{BuildHasher, Hash, Hasher},
         io::Write,
         mem::ManuallyDrop,
         ops::{AddAssign, Deref},
@@ -498,16 +496,25 @@ mod bench {
             Self::new(value)
         }
     }
+    macro_rules! max_val {
+        ($self: expr, $e: expr) => {{
+            let this = &mut $self.max;
+            *this = (*this).max($e);
+        }};
+    }
+    macro_rules! min_val {
+        ($self: expr, $e: expr) => {{
+            let this = &mut $self.min;
+            *this = ($e).min(*this);
+        }};
+    }
     impl AddAssign for Weather {
         #[inline(always)]
         fn add_assign(&mut self, other: Self) {
             self.sum += other.sum;
             self.count += other.count;
-            if other.max > self.max {
-                self.max = other.max;
-            } else if other.min < self.min {
-                self.min = other.min;
-            }
+            max_val!(self, other.max);
+            min_val!(self, other.min);
         }
     }
     impl AddAssign<isize> for Weather {
@@ -515,11 +522,8 @@ mod bench {
         fn add_assign(&mut self, value: isize) {
             self.sum += value as i64;
             self.count += 1;
-            if value > self.max {
-                self.max = value;
-            } else if value < self.min {
-                self.min = value;
-            }
+            max_val!(self, value);
+            min_val!(self, value);
         }
     }
 
@@ -553,112 +557,83 @@ mod bench {
         pub fn write(&self, buf: &mut Vec<u8>) {
             buf.extend_from_slice(self.name);
         }
+        #[inline(always)]
+        fn hash(&self) -> u64 {
+            let a = self.name;
+            let l = a.len();
+            let s = (!((l >> 3) | (l >> 4)) & 0x1) * (8 - (l & 0x7));
+            u64::from_le(read_unaligned!(a.as_ptr(), u64)) << (s << 3)
+        }
     }
     impl<'a> From<&'a [u8]> for City<'a> {
         fn from(value: &'a [u8]) -> Self {
             Self::new(value)
         }
     }
-    impl<'a> Hash for City<'a> {
-        fn hash<H: Hasher>(&self, state: &mut H) {
-            // self.name.hash(state);
-            let a = self.name;
-            match a.len() >> 4 {
-                0 => a.hash(state),
-                _ => {
-                    let mut ptr = a.as_ptr();
-                    read_unaligned!(ptr, u64).hash(state);
-                    ptr = ptr_add!(ptr, a.len() - 8);
-                    read_unaligned!(ptr, u64).hash(state);
-                }
-            }
-        }
-    }
     impl<'a> PartialEq for City<'a> {
         fn eq(&self, other: &Self) -> bool {
-            // self.name.eq(other.name)
-            #[inline(always)]
-            #[allow(unused_unsafe)]
-            fn simd_compare((mut a, mut b): (&[u8], &[u8])) -> bool {
-                macro_rules! cast_x8 {
-                    ($ty:expr, $e: expr) => {
-                        concat_idents!(ty = u, $ty {
-                            unsafe { slice::from_raw_parts::<ty>($e.as_ptr().cast(), 8) }
-                        })
-                    };
-                    ($ty:expr, $e: expr, $i:expr) => {
-                        concat_idents!(ty = u, $ty {
-                            unsafe { slice::from_raw_parts::<ty>(offset!($e.as_ptr(), $i).cast(), 8) }
-                        })
-                    };
-                }
-                macro_rules! simd_ne {
-                    ($w:expr, $a:expr, $b:expr) => {
-                        concat_idents!(simd = u, $w, x8 {
-                            <simd>::from_slice(cast_x8!($w, $a))
-                                != <simd>::from_slice(cast_x8!($w, $b))
-                        })
-                    };
-                    ($w:expr, $a:expr, $b:expr, $i:expr) => {
-                        concat_idents!(simd = u, $w, x8 {
-                            <simd>::from_slice(cast_x8!($w, $a, $i))
-                                != <simd>::from_slice(cast_x8!($w, $b, $i))
-                        })
-                    };
-                }
-                macro_rules! ne_u64 {
-                    ($a:expr, $b: expr, $len:expr) => {{
-                        read_unaligned!(offset!($a.as_ptr(), $len), u64)
-                            != read_unaligned!(offset!($b.as_ptr(), $len), u64)
-                    }};
-                }
-                loop {
-                    let mut len = a.len();
+            macro_rules! cast_x8 {
+                ($ty:expr, $e: expr) => {
+                    concat_idents!(ty = u, $ty {
+                        unsafe { slice::from_raw_parts::<ty>($e.as_ptr().cast(), 8) }
+                    })
+                };
+                ($ty:expr, $e: expr, $i:expr) => {
+                    concat_idents!(ty = u, $ty {
+                        unsafe { slice::from_raw_parts::<ty>(ptr_add!($e.as_ptr(), $i).cast(), 8) }
+                    })
+                };
+            }
+            macro_rules! simd_ne {
+                ($w:expr, $a:expr, $b:expr) => {
+                    concat_idents!(simd = u, $w, x8 {
+                        <simd>::from_slice(cast_x8!($w, $a))
+                            != <simd>::from_slice(cast_x8!($w, $b))
+                    })
+                };
+                ($w:expr, $a:expr, $b:expr, $i:expr) => {
+                    concat_idents!(simd = u, $w, x8 {
+                        <simd>::from_slice(cast_x8!($w, $a, $i))
+                            != <simd>::from_slice(cast_x8!($w, $b, $i))
+                    })
+                };
+            }
+            let mut a = self.name;
+            let mut b = other.name;
+            let mut len = a.len();
+            len == b.len()
+                && loop {
                     return match len >> 3 {
                         0 => {
-                            a.is_empty() || {
-                                let x = (8 - len) << 3;
-                                u64::from_le(read_unaligned!(a.as_ptr(), u64)) << x
-                                    == u64::from_le(read_unaligned!(b.as_ptr(), u64)) << x
-                            }
+                            let x = (8 - len) << 3;
+                            u64::from_le(read_unaligned!(a.as_ptr(), u64)) << x
+                                == u64::from_le(read_unaligned!(b.as_ptr(), u64)) << x
                         }
                         mut x => {
-                            len -= 8;
-                            if !(x & 0x1 == 1 && ne_u64!(a, b, len)
-                                || x != 1 && {
-                                    let y = x >> 1;
-                                    let z = y >> 1;
-                                    y & 0x1 == 1 && simd_ne!(16, a, b, (z & 0x01) << 5)
-                                        || y != 1 && {
-                                            z == 1 && simd_ne!(32, a, b)
-                                                || z >= 2 && simd_ne!(64, a, b)
-                                        }
-                                })
-                            {
+                            if !(x & 0x1 == 1 && {
+                                let x = len - 8;
+                                read_unaligned!(ptr_add!(a.as_ptr(), x), u64)
+                                    != read_unaligned!(ptr_add!(b.as_ptr(), x), u64)
+                            } || x != 1 && {
+                                let y = x >> 1;
+                                let z = y >> 1;
+                                y & 0x1 == 1 && simd_ne!(16, a, b, (z & 0x01) << 5)
+                                    || y != 1 && {
+                                        z == 1 && simd_ne!(32, a, b) || z >= 2 && simd_ne!(64, a, b)
+                                    }
+                            }) {
                                 x <<= 3;
-                                a = pst_slice!(a, x);
-                                b = pst_slice!(b, x);
-                                continue;
+                                return len == x || {
+                                    len -= x;
+                                    a = pst_slice!(a, x);
+                                    b = pst_slice!(b, x);
+                                    continue;
+                                };
                             }
                             false
                         }
                     };
                 }
-            }
-
-            #[inline(always)]
-            //fast detect first & last 2bytes base on the city statistics
-            fn fast_detect((a, b): (&[u8], &[u8])) -> bool {
-                let mut len = a.len();
-                len == b.len() && get!(a.as_ptr()) == get!(b.as_ptr()) && {
-                    len -= 2;
-                    read_unaligned!(offset!(a.as_ptr(), len), u16)
-                        == read_unaligned!(offset!(b.as_ptr(), len), u16)
-                }
-            }
-
-            let v = (self.name, other.name);
-            fast_detect(v) && simd_compare(v)
         }
     }
     impl<'a> Deref for City<'a> {
@@ -745,14 +720,13 @@ mod bench {
 
     #[derive(Clone, Copy)]
     enum MyWeatherNode<'a> {
-        Value((City<'a>, Weather)),
         Empty,
+        Value((City<'a>, Weather)),
     }
 
     pub struct MyWeatherMap<'a> {
         inner: Vec<MyWeatherNode<'a>>,
         inode: Vec<usize>,
-        hasher: RandomState,
     }
 
     impl<'a> Default for MyWeatherMap<'a> {
@@ -760,15 +734,11 @@ mod bench {
             MyWeatherMap {
                 inner: vec![MyWeatherNode::Empty; 1 << RESULT_BITS],
                 inode: Vec::with_capacity(10000),
-                hasher: RandomState::default(),
             }
         }
     }
 
     macro_rules! set {
-        ($v:expr, $r:expr) => {
-            unsafe { *$v = $r };
-        };
         ($v:expr, $i:expr, $r:expr) => {
             unsafe { *offset!($v, $i) = $r };
         };
@@ -802,18 +772,16 @@ mod bench {
         pub fn put(&mut self, (key, value): (City<'a>, isize)) {
             #[inline(always)]
             fn index(index: u64) -> usize {
-                (/* index.rotate_right(RESULT_BITS * 4)
-                ^  */(index >> (RESULT_BITS * 3))
+                ((index >> (RESULT_BITS * 3))
                     ^ (index >> (RESULT_BITS * 2))
                     ^ (index >> RESULT_BITS)
                     ^ index) as usize
             }
             const BUCKETS: usize = (1 << RESULT_BITS) - 1;
-            let hash_code = { self.hasher.hash_one(key) };
-            let ptr = self.inner.as_mut_ptr();
-            let (mut miss, mut index) = (0, index(hash_code) & BUCKETS);
+            let data_ptr = self.inner.as_mut_ptr();
+            let (mut miss, mut index) = (0, index(key.hash()) & BUCKETS);
             loop {
-                return match get_mut!(ptr, index) {
+                return match get_mut!(data_ptr, index) {
                     MyWeatherNode::Value((city, weather)) => {
                         if key.ne(city) {
                             miss += 1;
@@ -980,7 +948,7 @@ mod bench {
         let ptr = data.as_ptr();
         // boost performance with swar
         for _ in 0..end >> SHIFT {
-            let mut value = read_unaligned!(offset!(ptr, off), FindBase) ^ BASE_MASK_NL;
+            let mut value = read_unaligned!(ptr_add!(ptr, off), FindBase) ^ BASE_MASK_NL;
             value = (value - BASE_MASK1) & !value & BASE_MASK2;
             if value != 0 {
                 return Some(off + (value.trailing_zeros() >> 3) as usize);
@@ -1014,7 +982,7 @@ mod bench {
                 cache: [null(); SIMD_SOLTS],
                 cache_offset: 0,
                 cache_length: 0,
-                data_end: unsafe { offset!(data_ptr, data.len()) },
+                data_end: ptr_add!(data_ptr, data.len()),
                 data_align: data_ptr,
                 data_ptr,
                 mask,
@@ -1031,7 +999,7 @@ mod bench {
                 let unaligned = data_ptr.addr() & MASK;
                 if unaligned != 0 {
                     self.fill_unaligned(unsafe {
-                        offset!(
+                        ptr_add!(
                             data_ptr,
                             data_end
                                 .offset_from_unsigned(data_ptr)
@@ -1060,28 +1028,26 @@ mod bench {
         }
         #[inline(always)]
         fn fill(&mut self) -> bool {
-            const TIMES: usize = FIND_SIZE / BASE_SIZE;
             let mut cache_length = 0;
             let mut data_ptr = self.data_ptr;
             let cache_ptr = self.cache.as_mut_ptr();
             let data_align = self.data_align;
             let mask = self.mask;
             while data_ptr < data_align && cache_length == 0 {
-                let mut value = mask ^ get!(data_ptr.cast::<FindSimd>());
-                value = (value - FIND_MASK1) & !value & FIND_MASK2;
-                let value = value.as_array();
-                let mut off = data_ptr;
-                for j in 0..TIMES {
-                    let mut x = get!(value.as_ptr(), j);
+                let value = mask ^ get!(data_ptr.cast::<FindSimd>());
+                for mut x in ((value - FIND_MASK1) & !value & FIND_MASK2).to_array() {
                     while x != 0 {
                         let v = x.trailing_zeros();
-                        set!(cache_ptr, cache_length, ptr_add!(off, (v >> 3) as usize));
+                        set!(
+                            cache_ptr,
+                            cache_length,
+                            ptr_add!(data_ptr, (v >> 3) as usize)
+                        );
                         cache_length += 1;
                         x ^= 1 << v;
                     }
-                    off = ptr_add!(off, BASE_SIZE);
+                    data_ptr = ptr_add!(data_ptr, BASE_SIZE);
                 }
-                data_ptr = ptr_add!(data_ptr, FIND_SIZE);
             }
             self.data_ptr = data_ptr;
             self.cache_length = cache_length;
@@ -1128,7 +1094,7 @@ mod bench {
             let mut newline = self.leading;
             macro_rules! mid_slice {
                 ($s:expr, $e:expr) => {
-                    unsafe { slice::from_raw_parts($s, $e.offset_from_unsigned($s)) }
+                    unsafe { slice::from_raw_parts($s, ($e as usize) - ($s as usize)) }
                 };
             }
             let mut total = 0;
@@ -1144,11 +1110,11 @@ mod bench {
                 let mut comma = commas.next();
                 let city = { mid_slice!(newline, null_check!(comma)) };
                 let value = {
-                    comma = unsafe { offset!(comma, 1) };
+                    comma = ptr_add!(comma, 1);
                     newline = newlines.next();
                     mid_slice!(comma, null_check!(newline))
                 };
-                newline = unsafe { offset!(newline, 1) };
+                newline = ptr_add!(newline, 1);
                 f((city.into(), parse_number(value)));
                 total += 1;
             }
@@ -1171,36 +1137,30 @@ mod bench {
     }
 
     macro_rules! find_mask {
-        ($chr:expr, $mask: expr, $data_ptr:expr, $pos_ptr:expr, $leading:expr, $end: expr) => {{
-            const SHIFT: u32 = FIND_SIZE.ilog2();
-            const TIMES: usize = FIND_SIZE / BASE_SIZE;
-            let mut count = 0;
+        ($chr:expr, $mask: expr, $pos_ptr:expr, $data_ptr:expr, $end_ptr: expr) => {{
             // boost performance with simd
-            for _ in 0..($end - $leading) >> SHIFT {
-                let mut value = read_unaligned!(offset!($data_ptr, $leading), FindSimd) ^ $mask;
-                value = (value - FIND_MASK1) & !value & FIND_MASK2;
-                let value = value.as_array();
-                let mut off = $leading;
-                for j in 0..TIMES {
-                    let mut x = get!(value.as_ptr(), j);
+            let (mut count, last) = (0, $end_ptr.offset(-(FIND_SIZE as isize)));
+            while $data_ptr <= last {
+                let value = read_unaligned!($data_ptr, FindSimd) ^ $mask;
+                for mut x in ((value - FIND_MASK1) & !value & FIND_MASK2).to_array() {
                     while x != 0 {
                         let v = x.trailing_zeros();
-                        set!($pos_ptr, count, off + (v >> 3) as usize);
+                        set!($pos_ptr, count, ptr_add!($data_ptr, (v >> 3) as usize));
                         x ^= 1 << v;
                         count += 1;
                     }
-                    off += BASE_SIZE;
+                    $data_ptr = ptr_add!($data_ptr, BASE_SIZE);
                 }
-                if count > 0 {
+                if count != 0 {
                     return count;
                 }
-                $leading += FIND_SIZE;
             }
-            for j in $leading..$end {
-                if get!($data_ptr, j) == $chr {
-                    set!($pos_ptr, count, j);
+            while $data_ptr < $end_ptr {
+                if get!($data_ptr) == $chr {
+                    set!($pos_ptr, count, $data_ptr);
                     count += 1;
                 }
+                $data_ptr = ptr_add!($data_ptr, 1)
             }
             count
         }};
@@ -1211,37 +1171,42 @@ mod bench {
             #[inline(always)]
             #[allow(unused_unsafe)]
             pub fn $name(
-                data_ptr: *const u8,
-                pos_ptr: *mut usize,
-                mut leading: usize,
-                end: usize,
+                pos_ptr: *mut *const u8,
+                mut data_ptr: *const u8,
+                end_ptr: *const u8,
             ) -> usize {
-                find_mask!($chr, $mask, data_ptr, pos_ptr, leading, end)
+                unsafe { find_mask!($chr, $mask, pos_ptr, data_ptr, end_ptr) }
             }
         };
     }
     define_find!(find_comma_simd, CHR_CM, FIND_MASK_CM);
     define_find!(find_newline_simd, CHR_NL, FIND_MASK_NL);
 
-    #[allow(unused_unsafe)]
     pub fn decode_lines_b<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
         fn for_each<'a, F>(data: &'a [u8], mut f: F) -> u64
         where
             F: FnMut((City<'a>, isize)),
         {
-            let mut commas = [0; SIMD_SOLTS];
-            let mut newlns = [0; SIMD_SOLTS];
+            macro_rules! mid_slice {
+                ($s:expr, $e:expr) => {
+                    unsafe { slice::from_raw_parts($s, ($e as usize) - ($s as usize)) }
+                };
+            }
+            let mut commas = [null(); SIMD_SOLTS];
+            let mut newlns = [null(); SIMD_SOLTS];
             let cma_ptr = commas.as_mut_ptr();
             let nls_ptr = newlns.as_mut_ptr();
-            let (mut leading, mut total) = (0, 0u64);
-            let (data_ptr, end) = (data.as_ptr(), data.len());
+            let mut newline = data.as_ptr();
+            let end = ptr_add!(newline, data.len());
+            let mut total = 0u64;
             macro_rules! pipeline {
                 ($i:expr) => {{
-                    let comma = get!(cma_ptr, $i);
-                    let newline = get!(nls_ptr, $i);
-                    let city = mid_slice!(data, leading, comma);
-                    let value = mid_slice!(data, comma + 1, newline);
-                    leading = newline + 1;
+                    let mut comma = get!(cma_ptr, $i);
+                    let city = mid_slice!(newline, comma);
+                    newline = get!(nls_ptr, $i);
+                    comma = ptr_add!(comma, 1);
+                    let value = mid_slice!(comma, newline);
+                    newline = ptr_add!(newline, 1);
                     f((city.into(), parse_number(value)))
                 }};
             }
@@ -1251,10 +1216,9 @@ mod bench {
                 };
             }
             loop {
-                let mut avriable = find_comma_simd(data_ptr, cma_ptr, leading, end);
-                avriable =
-                    find_newline_simd(data_ptr, nls_ptr, get!(cma_ptr) + 1, end).min(avriable);
-                total += match avriable {
+                let mut count = find_comma_simd(cma_ptr, newline, end);
+                count = count.min(find_newline_simd(nls_ptr, ptr_add!(get!(cma_ptr), 1), end));
+                total += match count {
                     0 => break total,
                     1 => {
                         repeat!(0);
@@ -1287,9 +1251,9 @@ mod bench {
         let p = value.as_ptr();
         // signal bit 001(0)1101 => `-`
         let s = ((!get!(p) & 0x10) >> 4) as usize;
-        let l = (s + 4 - value.len()) << 3;
         // boost performance with swar
-        let v = u32::from_be(read_unaligned!(ptr_add!(p, s), u32) & 0x0F0F0F0F) >> l;
+        let v = u32::from_be(read_unaligned!(ptr_add!(p, s), u32) & 0x0F0F0F0F)
+            >> ((s + 4 - value.len()) << 3);
         (100 * (v >> 24) + 10 * ((v << 8) >> 24) + ((v << 24) >> 24)) as isize
             * (1 - (s << 1) as isize)
     }

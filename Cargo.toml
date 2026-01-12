@@ -1,6 +1,6 @@
 [package]
 name = "rs_1brc"
-version = "0.2.15"
+version = "0.2.16"
 edition = "2024"
 description = "The One Billion Row Challenge for RUST"
 license = "MIT"
@@ -13,7 +13,6 @@ fork = "0.6.0"
 indicatif = "0.18.3"
 libc = "0.2.180"
 proc-cpuinfo = "0.2.0"
-rapidhash = "4.2.0"
 rayon = "1.11.0"
 
 [profile.release]
