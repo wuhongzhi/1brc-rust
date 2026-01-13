@@ -8,6 +8,7 @@ if [ "$1" == "g" ]; then
     cargo flamegraph \
         --skip-after "rs_1brc::bench::decode_lines_a" \
         --skip-after "rs_1brc::bench::decode_lines_b" \
+        --skip-after "rs_1brc::bench::decode_lines_c" \
         --skip-after "<rs_1brc::bench::City as core::cmp::PartialEq>::eq" \
         --skip-after "<rapidhash::inner::state::random_state::RandomState<false, true, false, false> as core::hash::BuildHasher>::hash_one::<rs_1brc::bench::City>" \
         --release -- bench $@> /dev/null
