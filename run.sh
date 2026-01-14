@@ -30,12 +30,12 @@ else
         done |& grep real | sed -e 's/real//' | sort | nl
     elif [ "$1" == 'p' ]; then
         shift
-        perf stat $app bench $@ > /dev/null
+        perf stat  -d -d -d $app bench $@ > /dev/null
     else
         if [ -n "$target" ]; then
             target="--target $(echo $target | sed 's/\///')"
         fi
-        time cargo run --release $target -- bench $@
+        time cargo run --features hit_miss --release $target -- bench $@
     fi
 fi
 
