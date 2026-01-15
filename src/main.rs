@@ -1302,7 +1302,7 @@ mod bench {
             let mut head = data.as_ptr();
             let mut mark = head;
             let end = ptr_add!(head, data.len());
-            let last = ptr_add!(end, -((FIND_SIZE << 1) as isize));
+            let last = ptr_add!(end, -((FIND_SIZE * 3) as isize));
             let mut total = 0u64;
             macro_rules! put {
                 ($city:expr, $value: expr, $label:lifetime) => {{
@@ -1314,6 +1314,10 @@ mod bench {
             macro_rules! simd {
                 ($mask: expr) => {{
                     let value = $mask ^ read_unaligned!(head, FindBase);
+                    (value - BASE_MASK1) & !value & BASE_MASK2
+                }};
+                ($mask: expr, $i:expr) => {{
+                    let value = $mask ^ read_unaligned!(ptr_add!(head, $i), FindBase);
                     (value - BASE_MASK1) & !value & BASE_MASK2
                 }};
             }
@@ -1345,29 +1349,34 @@ mod bench {
                 ($value:expr) => {
                     ptr_add!(head, ($value.trailing_zeros() >> 3) as usize)
                 };
+                ($value:expr, $i: expr) => {
+                    ptr_add!(head, $i + ($value.trailing_zeros() >> 3) as usize)
+                };
             }
+            // let mut miss = 0;
             'next: while head <= last {
-                match simd!(BASE_MASK_CM) {
-                    0 => head = ptr_add!(head, BASE_SIZE),
-                    x => {
-                        let city = slice!(tzoff!(x));
-                        loop {
-                            match simd!(BASE_MASK_NL) {
-                                0 => {
-                                    head = ptr_add!(head, BASE_SIZE);
-                                    if head > last {
-                                        break;
-                                    }
-                                }
-                                x => {
-                                    let value = slice!(tzoff!(x));
-                                    put!(city, value, 'next);
-                                }
-                            }
-                        }
-                        find_nl!(city, 'next);
-                    }
+                macro_rules! break_br {
+                    ($v: expr, $i: expr) => {{
+                        let city = slice!(tzoff!($v, $i));
+                        let v = simd!(BASE_MASK_NL);
+                        let value = slice!(tzoff!(v));
+                        put!(city, value, 'next);
+                    }};
                 }
+                let mut v = simd!(BASE_MASK_CM);
+                if v != 0 {
+                    break_br!(v, 0);
+                }
+                v = simd!(BASE_MASK_CM, BASE_SIZE);
+                if v != 0 {
+                    break_br!(v, BASE_SIZE);
+                }
+                v = simd!(BASE_MASK_CM, BASE_SIZE + BASE_SIZE);
+                if v != 0 {
+                    break_br!(v, BASE_SIZE + BASE_SIZE);
+                }
+                // miss += 1;
+                head = ptr_add!(head, BASE_SIZE + BASE_SIZE + BASE_SIZE);
             }
             'next: while head < end {
                 match get!(head) {
@@ -1378,6 +1387,7 @@ mod bench {
                     }
                 }
             }
+            // eprintln!("{:.3}%", 100f64 * miss as f64 / total as f64);
             total
         }
         if dry_run {
