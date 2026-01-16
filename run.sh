@@ -20,6 +20,9 @@ else
     if [ "$1" == 'x' ]; then
         shift
         target="x86_64-unknown-linux-musl/"
+    elif [ "$1" == 'o' ]; then
+        shift
+        target="x86_64-unknown-linux-gnu/"
     fi
     app="./target/${target}release/rs_1brc"
     if [ "$1" == 'b' ]; then
@@ -30,12 +33,31 @@ else
         done |& grep real | sed -e 's/real//' | sort | nl
     elif [ "$1" == 'p' ]; then
         shift
-        perf stat  -d -d -d $app bench $@ > /dev/null
+        perf stat -d -d -d $app bench $@ > /dev/null
+    elif [ "$1" == '-h' ]; then
+        echo "\
+Usage: $0 [g|d|[x|o]] b|p|-hit
+    g - flame-chat graphic
+    d - data generate
+    x or o
+        x: musl build version
+        o: pgo build version
+
+    b - batch mode
+    p - perf overview
+
+    -hit compile with hit-miss support
+        "
     else
         if [ -n "$target" ]; then
             target="--target $(echo $target | sed 's/\///')"
         fi
-        time cargo run --features hit_miss --release $target -- bench $@
+        features=""
+        if [ "$1" == "-hit" ]; then
+            shift
+            features="--features hit_miss"
+        fi
+        time cargo run $features --release $target -- bench $@
     fi
 fi
 

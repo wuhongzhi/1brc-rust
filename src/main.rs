@@ -46,7 +46,7 @@ macro_rules! mid_slice {
         unsafe { slice::from_raw_parts(ptr_add!($d.as_ptr(), $s), $e - ($s)) }
     };
 }
-const RESULT_BITS: u32 = 16;
+const RESULT_BITS: u32 = 15;
 
 /// 1BRC for RUST
 #[derive(Parser)]
@@ -454,7 +454,6 @@ mod bench {
     use concat_idents::concat_idents;
     use core::slice;
     use proc_cpuinfo::CpuInfo;
-    // use rapidhash::fast::RandomState;
     use rayon::prelude::*;
     use std::{
         collections::BTreeMap,
@@ -568,10 +567,10 @@ mod bench {
         fn hash(&self) -> u64 {
             let a = self.name;
             let l = a.len();
-            let s = (!((l >> 3) | (l >> 4) | (l >> 5)) & 0x1) * (8 - (l & 0x7));
+            let s = ((l < 8) as usize) * (8 - (l & 0x7));
             // first 8 bytes(move to hight is less than 8 bytes) ^ last 2 bytes
             u64::from_le(read_unaligned!(a.as_ptr(), u64)) << (s << 3)
-            /* ^ u16::from_le(read_unaligned!(ptr_add!(a.as_ptr(), l - 2), u16)) as u64 */
+                ^ u16::from_le(read_unaligned!(ptr_add!(a.as_ptr(), l - 2), u16)) as u64
         }
     }
     impl<'a> From<&'a [u8]> for City<'a> {
@@ -614,17 +613,27 @@ mod bench {
                 return false;
             }
             loop {
+                macro_rules! uget {
+                    ($a:expr) => {
+                        u64::from_le(read_unaligned!($a.as_ptr(), u64))
+                    };
+                    ($a:expr, $i:expr) => {
+                        u64::from_le(read_unaligned!(ptr_add!($a.as_ptr(), $i), u64))
+                    };
+                }
                 return match len >> 3 {
                     0 => {
                         let x = (8 - len) << 3;
-                        u64::from_le(read_unaligned!(a.as_ptr(), u64)) << x
-                            == u64::from_le(read_unaligned!(b.as_ptr(), u64)) << x
+                        (uget!(a) << x) == (uget!(b) << x)
+                    }
+                    1 => {
+                        let x = len - 8;
+                        (uget!(a) == uget!(b)) && (uget!(a, x) == uget!(b, x))
                     }
                     mut x => {
                         if !((x & 0x1 == 1) & {
                             let x = len - 8;
-                            read_unaligned!(ptr_add!(a.as_ptr(), x), u64)
-                                != read_unaligned!(ptr_add!(b.as_ptr(), x), u64)
+                            uget!(a, x) != uget!(b, x)
                         } || x != 1 && {
                             let y = x >> 1;
                             let z = y >> 1;
@@ -734,24 +743,16 @@ mod bench {
 
     pub type WeatherMap<'a> = MyWeatherMap<'a>;
 
-    #[derive(Clone, Copy)]
-    enum MyWeatherNode<'a> {
-        Empty,
-        Value((City<'a>, Weather)),
-    }
-
     pub struct MyWeatherMap<'a> {
-        inner: Vec<MyWeatherNode<'a>>,
-        inode: Vec<usize>,
-        // hasher: RandomState,
+        index: [usize; 1 << RESULT_BITS],
+        inode: Vec<(City<'a>, Weather)>,
     }
 
     impl<'a> Default for MyWeatherMap<'a> {
         fn default() -> Self {
             MyWeatherMap {
-                inner: vec![MyWeatherNode::Empty; 1 << RESULT_BITS],
+                index: [usize::MAX; 1 << RESULT_BITS],
                 inode: Vec::with_capacity(10000),
-                // hasher: RandomState::default(),
             }
         }
     }
@@ -771,20 +772,13 @@ mod bench {
             self.inode.len()
         }
         pub fn reset(&mut self) -> &mut Self {
-            let ptr = self.inner.as_mut_ptr();
-            self.inode.iter().for_each(|i| {
-                set!(ptr, *i, MyWeatherNode::Empty);
-            });
-            self.inode.clear();
+            *self = Default::default();
             self
         }
         pub fn get(&self, city: &City<'static>) -> Option<Weather> {
-            let ptr = self.inner.as_ptr();
             for i in self.inode.iter() {
-                if let MyWeatherNode::Value(v) = get!(ptr, *i)
-                    && v.0.eq(city)
-                {
-                    return Some(v.1);
+                if i.0.eq(city) {
+                    return Some(i.1);
                 }
             }
             None
@@ -798,42 +792,41 @@ mod bench {
                 ((index >> (RESULT_BITS * 3))
                     ^ (index >> (RESULT_BITS * 2))
                     ^ (index >> RESULT_BITS)
-                    ^ (index * 41)) as usize
+                    ^ (index & BUCKETS as u64)) as usize
+                    * 41
             }
-            let data_ptr = self.inner.as_mut_ptr();
+            let inode_ptr = self.inode.as_mut_ptr();
+            let data_ptr = self.index.as_mut_ptr();
             let (mut miss, mut index) = (0, index(key.hash()) & BUCKETS);
             loop {
-                return match get_mut!(data_ptr, index) {
-                    MyWeatherNode::Value((city, weather)) => {
-                        if key.ne(city) {
-                            miss += 1;
-                            if miss < BUCKETS {
-                                index = (index + 31) & BUCKETS;
-                                continue;
-                            }
-                            panic!("Map is full!");
+                let node = get_mut!(data_ptr, index);
+                return if *node != usize::MAX {
+                    let (city, weather) = get_mut!(inode_ptr, *node);
+                    if key.ne(city) {
+                        miss += 1;
+                        if miss < BUCKETS {
+                            index = (index + 31) & BUCKETS;
+                            continue;
                         }
-                        *weather += value;
-                        #[cfg(feature = "hit_miss")]
-                        HIS_MISS.with(|x| x.fetch_add(miss, Ordering::AcqRel));
+                        panic!("Map is full!");
                     }
-                    node => {
-                        *node = MyWeatherNode::Value((key, value.into()));
-                        self.inode.push(index);
-                    }
+                    *weather += value;
+                    #[cfg(feature = "hit_miss")]
+                    HIS_MISS.with(|x| x.fetch_add(miss, Ordering::AcqRel));
+                } else {
+                    let inode = &mut self.inode;
+                    *node = inode.len();
+                    inode.push((key, value.into()));
                 };
             }
         }
     }
 
     impl<'a> From<MyWeatherMap<'a>> for BTreeMap<City<'a>, Weather> {
-        fn from(mut val: MyWeatherMap<'a>) -> Self {
+        fn from(val: MyWeatherMap<'a>) -> Self {
             let mut r = BTreeMap::default();
-            let ptr = val.inner.as_mut_ptr();
             for i in val.inode {
-                if let MyWeatherNode::Value((city, weather)) = get!(ptr, i) {
-                    r.insert(city, weather);
-                }
+                r.insert(i.0, i.1);
             }
             r
         }
@@ -1311,7 +1304,7 @@ mod bench {
                     continue $label;
                 }}
             }
-            macro_rules! simd {
+            macro_rules! find {
                 ($mask: expr) => {{
                     let value = $mask ^ read_unaligned!(head, FindBase);
                     (value - BASE_MASK1) & !value & BASE_MASK2
@@ -1332,19 +1325,6 @@ mod bench {
                     }
                 };
             }
-            macro_rules! find_nl {
-                ($city:expr, $label:lifetime) => {{
-                    while head < end {
-                        match get!(head) {
-                            CHR_NL => {
-                                let value = slice!(head);
-                                put!($city, value, $label);
-                            }
-                            _ => head = ptr_add!(head, 1),
-                        }
-                    }
-                }};
-            }
             macro_rules! tzoff {
                 ($value:expr) => {
                     ptr_add!(head, ($value.trailing_zeros() >> 3) as usize)
@@ -1358,33 +1338,40 @@ mod bench {
                 macro_rules! break_br {
                     ($v: expr, $i: expr) => {{
                         let city = slice!(tzoff!($v, $i));
-                        let v = simd!(BASE_MASK_NL);
+                        let v = find!(BASE_MASK_NL);
                         let value = slice!(tzoff!(v));
                         put!(city, value, 'next);
                     }};
                 }
-                let mut v = simd!(BASE_MASK_CM);
-                if v != 0 {
-                    break_br!(v, 0);
+                macro_rules! step {
+                    ($i:expr) => {{
+                        let v = find!(BASE_MASK_CM, $i * BASE_SIZE);
+                        if v != 0 {
+                            break_br!(v, $i * BASE_SIZE);
+                        }
+                    }};
                 }
-                v = simd!(BASE_MASK_CM, BASE_SIZE);
-                if v != 0 {
-                    break_br!(v, BASE_SIZE);
-                }
-                v = simd!(BASE_MASK_CM, BASE_SIZE + BASE_SIZE);
-                if v != 0 {
-                    break_br!(v, BASE_SIZE + BASE_SIZE);
-                }
+                step!(0);
+                step!(1);
+                step!(2);
                 // miss += 1;
                 head = ptr_add!(head, BASE_SIZE + BASE_SIZE + BASE_SIZE);
             }
             'next: while head < end {
                 match get!(head) {
-                    CHR_CM => head = ptr_add!(head, 1),
-                    _ => {
+                    CHR_CM => {
                         let city = slice!(head);
-                        find_nl!(city, 'next);
+                        while head < end {
+                            match get!(head) {
+                                CHR_NL => {
+                                    let value = slice!(head);
+                                    put!(city, value, 'next);
+                                }
+                                _ => head = ptr_add!(head, 1),
+                            }
+                        }
                     }
+                    _ => head = ptr_add!(head, 1),
                 }
             }
             // eprintln!("{:.3}%", 100f64 * miss as f64 / total as f64);
@@ -1427,7 +1414,7 @@ mod bench {
         }
         let p = value.as_ptr();
         // signal bit 001(0)1101 => `-`
-        let s = ((!get!(p) >> 4) & 0x1) as usize;
+        let s = (get!(p) == b'-') as usize;
         // boost performance with swar
         let v = u32::from_le(read_unaligned!(ptr_add!(p, s), u32) & 0x0F0F0F0F)
             << ((s + 4 - value.len()) << 3);
