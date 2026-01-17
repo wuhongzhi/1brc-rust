@@ -47,6 +47,7 @@ macro_rules! mid_slice {
     };
 }
 const RESULT_BITS: u32 = 15;
+const DEFULAT_CITIES: usize = 413;
 
 /// 1BRC for RUST
 #[derive(Parser)]
@@ -58,7 +59,6 @@ enum Cli {
     /// Run benchmark
     Bench(BenchArg),
 }
-const DEFULAT_CITIES: usize = 413;
 #[derive(Args)]
 struct GenerateArg {
     /// Record size
@@ -469,70 +469,6 @@ mod bench {
         time::SystemTime,
     };
 
-    #[derive(Clone, Copy)]
-    pub struct Weather {
-        min: isize,
-        max: isize,
-        sum: i64,
-        count: u64,
-    }
-    impl Weather {
-        fn new(value: isize) -> Self {
-            Self {
-                min: value,
-                max: value,
-                sum: value as i64,
-                count: 1,
-            }
-        }
-        fn write(&self, buf: &mut Vec<u8>) {
-            let mut avg = (self.sum as f64 / self.count as f64).round();
-            if avg.abs() < 1.0 {
-                avg = 0f64;
-            }
-            buf.extend_from_slice((self.min as f64 / 10f64).format(1).as_bytes());
-            buf.push(b'/');
-            buf.extend_from_slice((avg / 10f64).format(1).as_bytes());
-            buf.push(b'/');
-            buf.extend_from_slice((self.max as f64 / 10f64).format(1).as_bytes());
-        }
-    }
-    impl From<isize> for Weather {
-        fn from(value: isize) -> Self {
-            Self::new(value)
-        }
-    }
-    macro_rules! max_val {
-        ($self: expr, $e: expr) => {{
-            let this = &mut $self.max;
-            *this = (*this).max($e);
-        }};
-    }
-    macro_rules! min_val {
-        ($self: expr, $e: expr) => {{
-            let this = &mut $self.min;
-            *this = ($e).min(*this);
-        }};
-    }
-    impl AddAssign for Weather {
-        #[inline(always)]
-        fn add_assign(&mut self, other: Self) {
-            self.sum += other.sum;
-            self.count += other.count;
-            max_val!(self, other.max);
-            min_val!(self, other.min);
-        }
-    }
-    impl AddAssign<isize> for Weather {
-        #[inline(always)]
-        fn add_assign(&mut self, value: isize) {
-            self.sum += value as i64;
-            self.count += 1;
-            max_val!(self, value);
-            min_val!(self, value);
-        }
-    }
-
     macro_rules! get {
         ($v:expr) => {
             unsafe { *$v }
@@ -628,7 +564,7 @@ mod bench {
                     }
                     1 => {
                         let x = len - 8;
-                        (uget!(a) == uget!(b)) && (uget!(a, x) == uget!(b, x))
+                        (uget!(a, x) == uget!(b, x)) && (uget!(a) == uget!(b))
                     }
                     mut x => {
                         if !((x & 0x1 == 1) & {
@@ -663,6 +599,70 @@ mod bench {
             self.name
         }
     }
+    #[derive(Clone, Copy)]
+    pub struct Weather {
+        sum: i64,
+        count: usize,
+        min: isize,
+        max: isize,
+    }
+    impl Weather {
+        fn new(value: isize) -> Self {
+            Self {
+                min: value,
+                max: value,
+                sum: value as i64,
+                count: 1,
+            }
+        }
+        fn write(&self, buf: &mut Vec<u8>) {
+            let mut avg = (self.sum as f64 / self.count as f64).round();
+            if avg.abs() < 1.0 {
+                avg = 0f64;
+            }
+            buf.extend_from_slice((self.min as f64 / 10f64).format(1).as_bytes());
+            buf.push(b'/');
+            buf.extend_from_slice((avg / 10f64).format(1).as_bytes());
+            buf.push(b'/');
+            buf.extend_from_slice((self.max as f64 / 10f64).format(1).as_bytes());
+        }
+    }
+    impl From<isize> for Weather {
+        fn from(value: isize) -> Self {
+            Self::new(value)
+        }
+    }
+    macro_rules! max_val {
+        ($self: expr, $e: expr) => {{
+            let this = &mut $self.max;
+            *this = (*this).max($e);
+        }};
+    }
+    macro_rules! min_val {
+        ($self: expr, $e: expr) => {{
+            let this = &mut $self.min;
+            *this = ($e).min(*this);
+        }};
+    }
+    impl AddAssign for Weather {
+        #[inline(always)]
+        fn add_assign(&mut self, other: Self) {
+            self.sum += other.sum;
+            self.count += other.count;
+            max_val!(self, other.max);
+            min_val!(self, other.min);
+        }
+    }
+    impl AddAssign<isize> for Weather {
+        #[inline(always)]
+        fn add_assign(&mut self, value: isize) {
+            self.sum += value as i64;
+            self.count += 1;
+            max_val!(self, value);
+            min_val!(self, value);
+        }
+    }
+
     pub trait ThousandSep {
         fn format(&self, decimal: usize) -> String;
     }
@@ -742,16 +742,17 @@ mod bench {
     }
 
     pub type WeatherMap<'a> = MyWeatherMap<'a>;
+    pub struct MyWeatherNode<'a>(City<'a>, Weather);
 
     pub struct MyWeatherMap<'a> {
-        index: [usize; 1 << RESULT_BITS],
-        inode: Vec<(City<'a>, Weather)>,
+        index: [u32; 1 << RESULT_BITS],
+        inode: Vec<MyWeatherNode<'a>>,
     }
 
     impl<'a> Default for MyWeatherMap<'a> {
         fn default() -> Self {
             MyWeatherMap {
-                index: [usize::MAX; 1 << RESULT_BITS],
+                index: [u32::MAX; 1 << RESULT_BITS],
                 inode: Vec::with_capacity(10000),
             }
         }
@@ -793,30 +794,29 @@ mod bench {
                     ^ (index >> (RESULT_BITS * 2))
                     ^ (index >> RESULT_BITS)
                     ^ (index & BUCKETS as u64)) as usize
-                    * 41
             }
             let inode_ptr = self.inode.as_mut_ptr();
             let data_ptr = self.index.as_mut_ptr();
             let (mut miss, mut index) = (0, index(key.hash()) & BUCKETS);
             loop {
                 let node = get_mut!(data_ptr, index);
-                return if *node != usize::MAX {
-                    let (city, weather) = get_mut!(inode_ptr, *node);
-                    if key.ne(city) {
+                return if *node == u32::MAX {
+                    let inode = &mut self.inode;
+                    *node = inode.len() as u32;
+                    inode.push(MyWeatherNode(key, value.into()));
+                } else {
+                    let node = get_mut!(inode_ptr, *node as usize);
+                    if key.ne(&node.0) {
                         miss += 1;
-                        if miss < BUCKETS {
+                        if miss <= BUCKETS {
                             index = (index + 31) & BUCKETS;
                             continue;
                         }
                         panic!("Map is full!");
                     }
-                    *weather += value;
+                    node.1 += value;
                     #[cfg(feature = "hit_miss")]
                     HIS_MISS.with(|x| x.fetch_add(miss, Ordering::AcqRel));
-                } else {
-                    let inode = &mut self.inode;
-                    *node = inode.len();
-                    inode.push((key, value.into()));
                 };
             }
         }
@@ -857,6 +857,7 @@ mod bench {
         }
         pub fn wait(self, clock: SystemTime) -> Result<()> {
             let taken = clock.elapsed()?;
+            #[cfg(feature = "hit_miss")]
             eprintln!(
                 "Result in {}ms with {} lines and {} cities, on average of {:.3}ns/line, hit-miss {:.3}%",
                 (taken.as_micros() as f64 / 1_000_f64).format(3),
@@ -864,6 +865,14 @@ mod bench {
                 self.0.0.0.len().format(0),
                 taken.as_nanos() as f64 / self.0.0.1.max(1) as f64 * self.0.1 as f64,
                 self.0.0.2 as f64 * 100_f64 / self.0.0.1.max(1) as f64
+            );
+            #[cfg(not(feature = "hit_miss"))]
+            eprintln!(
+                "Result in {}ms with {} lines and {} cities, on average of {:.3}ns/line",
+                (taken.as_micros() as f64 / 1_000_f64).format(3),
+                self.0.0.1.format(0),
+                self.0.0.0.len().format(0),
+                taken.as_nanos() as f64 / self.0.0.1.max(1) as f64 * self.0.1 as f64,
             );
             Ok(())
         }
