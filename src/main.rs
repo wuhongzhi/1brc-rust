@@ -46,7 +46,7 @@ macro_rules! mid_slice {
         unsafe { slice::from_raw_parts(ptr_add!($d.as_ptr(), $s), $e - ($s)) }
     };
 }
-const RESULT_BITS: u32 = 15;
+const HASH_SIZE: usize = (1 << 15) - 1;
 const DEFULAT_CITIES: usize = 413;
 
 /// 1BRC for RUST
@@ -449,7 +449,7 @@ mod r#gen {
     }
 }
 mod bench {
-    use crate::RESULT_BITS;
+    use crate::{DEFULAT_CITIES, HASH_SIZE};
     use anyhow::{Ok, Result};
     use concat_idents::concat_idents;
     use core::slice;
@@ -501,12 +501,23 @@ mod bench {
         }
         #[inline(always)]
         fn hash(&self) -> u64 {
+            const TABLE: [u64; 8] = [
+                0x2020202020202020,
+                0x20202020202020 << 8,
+                0x202020202020 << 16,
+                0x2020202020 << 24,
+                0x20202020 << 32,
+                0x202020 << 40,
+                0x2020 << 48,
+                0x20 << 56,
+            ];
+
             let a = self.name;
             let l = a.len();
             let s = ((l < 8) as usize) * (8 - (l & 0x7));
             // first 8 bytes(move to hight is less than 8 bytes) ^ last 2 bytes
-            u64::from_le(read_unaligned!(a.as_ptr(), u64)) << (s << 3)
-                ^ u16::from_le(read_unaligned!(ptr_add!(a.as_ptr(), l - 2), u16)) as u64
+            (u64::from_le(read_unaligned!(a.as_ptr(), u64)) << (s << 3)) - get!(TABLE.as_ptr(), s)
+                + (u16::from_le(read_unaligned!(ptr_add!(a.as_ptr(), l - 2), u16)) - 0x2020) as u64
         }
     }
     impl<'a> From<&'a [u8]> for City<'a> {
@@ -745,15 +756,15 @@ mod bench {
     pub struct MyWeatherNode<'a>(City<'a>, Weather);
 
     pub struct MyWeatherMap<'a> {
-        index: [u32; 1 << RESULT_BITS],
+        index: [u16; HASH_SIZE],
         inode: Vec<MyWeatherNode<'a>>,
     }
 
     impl<'a> Default for MyWeatherMap<'a> {
         fn default() -> Self {
             MyWeatherMap {
-                index: [u32::MAX; 1 << RESULT_BITS],
-                inode: Vec::with_capacity(10000),
+                index: [u16::MAX; HASH_SIZE],
+                inode: Vec::with_capacity(DEFULAT_CITIES),
             }
         }
     }
@@ -787,29 +798,25 @@ mod bench {
         // TODO: refine this method
         #[inline(always)]
         pub fn put(&mut self, (key, value): (City<'a>, isize)) {
-            const BUCKETS: usize = (1 << RESULT_BITS) - 1;
             #[inline(always)]
             fn index(index: u64) -> usize {
-                ((index >> (RESULT_BITS * 3))
-                    ^ (index >> (RESULT_BITS * 2))
-                    ^ (index >> RESULT_BITS)
-                    ^ (index & BUCKETS as u64)) as usize
+                ((index >> 53) ^ (index >> 31) ^ (index >> 17) ^ index) as usize
             }
             let inode_ptr = self.inode.as_mut_ptr();
             let data_ptr = self.index.as_mut_ptr();
-            let (mut miss, mut index) = (0, index(key.hash()) & BUCKETS);
+            let (mut miss, mut index) = (0, index(key.hash()) & HASH_SIZE);
             loop {
                 let node = get_mut!(data_ptr, index);
-                return if *node == u32::MAX {
+                return if *node == u16::MAX {
                     let inode = &mut self.inode;
-                    *node = inode.len() as u32;
+                    *node = inode.len() as u16;
                     inode.push(MyWeatherNode(key, value.into()));
                 } else {
                     let node = get_mut!(inode_ptr, *node as usize);
                     if key.ne(&node.0) {
                         miss += 1;
-                        if miss <= BUCKETS {
-                            index = (index + 31) & BUCKETS;
+                        if miss <= HASH_SIZE {
+                            index = (index + 31) & HASH_SIZE;
                             continue;
                         }
                         panic!("Map is full!");
@@ -1405,20 +1412,20 @@ mod bench {
     fn parse_number(value: &[u8]) -> isize {
         // const S_SHIFT: usize = (size_of::<isize>() << 3) - 1;
         const TABLE_S: [usize; 2] = [0x0, usize::from_ne_bytes([0xFF; size_of::<usize>()])];
-        // const TABLE_XXX: [u32; 10] = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900];
-        // const TABLE_XX: [u32; 10] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90];
+        const TABLE_XXX: [u32; 10] = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900];
+        const TABLE_XX: [u32; 10] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90];
         macro_rules! lookup {
             (TABLE_S, $i: expr) => {
                 get!(TABLE_S.as_ptr(), ($i) as usize)
                 // ((($i) as isize) << S_SHIFT >> S_SHIFT) as usize
             };
             (TABLE_XX, $i: expr) => {
-                // get!(TABLE_XX.as_ptr(), ($i) as usize)
-                ($i) * 10
+                get!(TABLE_XX.as_ptr(), ($i) as usize)
+                // ($i) * 10
             };
             (TABLE_XXX, $i: expr) => {
-                // get!(TABLE_XXX.as_ptr(), ($i) as usize)
-                ($i) * 100
+                get!(TABLE_XXX.as_ptr(), ($i) as usize)
+                // ($i) * 100
             };
         }
         let p = value.as_ptr();
