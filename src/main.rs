@@ -22,9 +22,9 @@ macro_rules! ptr_add {
         ($e as usize as isize + ($i)  as isize) as usize as *const u8
     };
 }
-macro_rules! offset {
-    ($e:expr, $i:expr) => {
-        $e.add($i)
+macro_rules! ptr_inc {
+    ($e: expr, $i: expr) => {
+        $e = ($e as usize as isize + ($i)  as isize) as usize as *const u8
     };
 }
 macro_rules! pre_slice {
@@ -46,7 +46,7 @@ macro_rules! mid_slice {
         unsafe { slice::from_raw_parts(ptr_add!($d.as_ptr(), $s), $e - ($s)) }
     };
 }
-const HASH_SIZE: usize = (1 << 15) - 1;
+const HASH_SIZE: usize = 1 << 15;
 const DEFULAT_CITIES: usize = 413;
 
 /// 1BRC for RUST
@@ -451,11 +451,11 @@ mod r#gen {
 mod bench {
     use crate::{DEFULAT_CITIES, HASH_SIZE};
     use anyhow::{Ok, Result};
-    use concat_idents::concat_idents;
     use core::slice;
     use proc_cpuinfo::CpuInfo;
     use rayon::prelude::*;
     use std::{
+        cell::Cell,
         collections::BTreeMap,
         fmt::Display,
         fs::File,
@@ -463,28 +463,21 @@ mod bench {
         mem::ManuallyDrop,
         ops::{AddAssign, Deref},
         ptr::null,
-        simd::{u16x8, u32x8, u64x8},
-        sync::atomic::{AtomicUsize, Ordering},
         thread,
         time::SystemTime,
     };
 
-    macro_rules! get {
-        ($v:expr) => {
-            unsafe { *$v }
-        };
-        ($v:expr, $i:expr) => {
-            unsafe { *offset!($v, $i) }
-        };
-    }
-    macro_rules! get_mut {
-        ($v:expr, $i:expr) => {
-            unsafe { &mut *offset!($v, $i) }
+    macro_rules! read {
+        ($p:expr) => {
+            unsafe { *$p }
         };
     }
     macro_rules! read_unaligned {
         ($p:expr, $ty:ty) => {
             unsafe { $p.cast::<$ty>().read_unaligned() }
+        };
+        ($p:expr, $i:expr, $ty:ty) => {
+            unsafe { ptr_add!($p, $i).cast::<$ty>().read_unaligned() }
         };
     }
     #[repr(transparent)]
@@ -516,8 +509,8 @@ mod bench {
             let l = a.len();
             let s = ((l < 8) as usize) * (8 - (l & 0x7));
             // first 8 bytes(move to hight is less than 8 bytes) ^ last 2 bytes
-            (u64::from_le(read_unaligned!(a.as_ptr(), u64)) << (s << 3)) - get!(TABLE.as_ptr(), s)
-                + (u16::from_le(read_unaligned!(ptr_add!(a.as_ptr(), l - 2), u16)) - 0x2020) as u64
+            ((u64::from_le(read_unaligned!(a.as_ptr(), u64)) << (s << 3)) - TABLE[s])
+                ^ (u16::from_le(read_unaligned!(a.as_ptr(), l - 2, u16)) - 0x2020) as u64
         }
     }
     impl<'a> From<&'a [u8]> for City<'a> {
@@ -527,79 +520,29 @@ mod bench {
     }
     impl<'a> PartialEq for City<'a> {
         fn eq(&self, other: &Self) -> bool {
-            macro_rules! cast_x8 {
-                ($ty:expr, $e: expr) => {
-                    concat_idents!(ty = u, $ty {
-                        unsafe { slice::from_raw_parts::<ty>($e.as_ptr().cast(), 8) }
-                    })
-                };
-                ($ty:expr, $e: expr, $i:expr) => {
-                    concat_idents!(ty = u, $ty {
-                        unsafe { slice::from_raw_parts::<ty>(ptr_add!($e.as_ptr(), $i).cast(), 8) }
-                    })
-                };
-            }
-            macro_rules! simd_ne {
-                ($w:expr, $a:expr, $b:expr) => {
-                    concat_idents!(simd = u, $w, x8 {
-                        <simd>::from_slice(cast_x8!($w, $a))
-                            != <simd>::from_slice(cast_x8!($w, $b))
-                    })
-                };
-                ($w:expr, $a:expr, $b:expr, $i:expr) => {
-                    concat_idents!(simd = u, $w, x8 {
-                        <simd>::from_slice(cast_x8!($w, $a, $i))
-                            != <simd>::from_slice(cast_x8!($w, $b, $i))
-                    })
-                };
-            }
-            let mut a = self.name;
-            let mut b = other.name;
-            let mut len = a.len();
+            let a = self.name;
+            let b = other.name;
+            let len = a.len();
             if len != b.len() {
                 return false;
             }
-            loop {
-                macro_rules! uget {
-                    ($a:expr) => {
-                        u64::from_le(read_unaligned!($a.as_ptr(), u64))
-                    };
-                    ($a:expr, $i:expr) => {
-                        u64::from_le(read_unaligned!(ptr_add!($a.as_ptr(), $i), u64))
-                    };
-                }
-                return match len >> 3 {
-                    0 => {
-                        let x = (8 - len) << 3;
-                        (uget!(a) << x) == (uget!(b) << x)
-                    }
-                    1 => {
-                        let x = len - 8;
-                        (uget!(a, x) == uget!(b, x)) && (uget!(a) == uget!(b))
-                    }
-                    mut x => {
-                        if !((x & 0x1 == 1) & {
-                            let x = len - 8;
-                            uget!(a, x) != uget!(b, x)
-                        } || x != 1 && {
-                            let y = x >> 1;
-                            let z = y >> 1;
-                            y & 0x1 == 1 && simd_ne!(16, a, b, (z & 0x01) << 5)
-                                || y != 1 && {
-                                    z == 1 && simd_ne!(32, a, b) || z >= 2 && simd_ne!(64, a, b)
-                                }
-                        }) {
-                            x <<= 3;
-                            return len == x || {
-                                len -= x;
-                                a = pst_slice!(a, x);
-                                b = pst_slice!(b, x);
-                                continue;
-                            };
-                        }
-                        false
-                    }
+            macro_rules! uget {
+                ($a:expr) => {
+                    u64::from_le(read_unaligned!($a.as_ptr(), u64))
                 };
+                ($a:expr, $i:expr) => {
+                    u64::from_le(read_unaligned!($a.as_ptr(), $i, u64))
+                };
+            }
+            if len <= 8 {
+                let x = (8 - len) << 3;
+                (uget!(a) << x) == (uget!(b) << x)
+            } else if len <= 16 {
+                let x = (16 - len) << 3;
+                ((uget!(a, 8) << x) == (uget!(b, 8) << x)) & (uget!(a) == uget!(b))
+            } else {
+                let x = len - 8;
+                (uget!(a, x) == uget!(b, x)) & (uget!(a, 8) == uget!(b, 8)) & (uget!(a) == uget!(b))
             }
         }
     }
@@ -769,14 +712,8 @@ mod bench {
         }
     }
 
-    macro_rules! set {
-        ($v:expr, $i:expr, $r:expr) => {
-            unsafe { *offset!($v, $i) = $r };
-        };
-    }
-
     thread_local! {
-        static HIS_MISS: AtomicUsize = const { AtomicUsize::new(0) };
+        static HIS_MISS: Cell<usize> = const { Cell::new(0) };
     }
     #[allow(dead_code)]
     impl<'a> MyWeatherMap<'a> {
@@ -799,31 +736,33 @@ mod bench {
         #[inline(always)]
         pub fn put(&mut self, (key, value): (City<'a>, isize)) {
             #[inline(always)]
-            fn index(index: u64) -> usize {
-                ((index >> 53) ^ (index >> 31) ^ (index >> 17) ^ index) as usize
+            fn hash(index: u64) -> usize {
+                ((index >> 45) ^ (index >> 30) ^ (index >> 15) ^ index) as usize
             }
-            let inode_ptr = self.inode.as_mut_ptr();
-            let data_ptr = self.index.as_mut_ptr();
-            let (mut miss, mut index) = (0, index(key.hash()) & HASH_SIZE);
+            const MASK: usize = HASH_SIZE - 1;
+            let inode = &mut self.inode;
+            let index = &mut self.index;
+            let (mut miss, mut slot) = (0, hash(key.hash()) & MASK);
             loop {
-                let node = get_mut!(data_ptr, index);
+                let node = &mut index[slot];
                 return if *node == u16::MAX {
                     let inode = &mut self.inode;
                     *node = inode.len() as u16;
                     inode.push(MyWeatherNode(key, value.into()));
                 } else {
-                    let node = get_mut!(inode_ptr, *node as usize);
-                    if key.ne(&node.0) {
+                    let node = &mut inode[*node as usize];
+                    if key.eq(&node.0) {
+                        node.1 += value;
+                        #[cfg(feature = "hit_miss")]
+                        HIS_MISS.with(|x| x.set(x.get() + miss));
+                    } else {
                         miss += 1;
-                        if miss <= HASH_SIZE {
-                            index = (index + 31) & HASH_SIZE;
+                        if miss < HASH_SIZE {
+                            slot = (slot + 31) & MASK;
                             continue;
                         }
                         panic!("Map is full!");
                     }
-                    node.1 += value;
-                    #[cfg(feature = "hit_miss")]
-                    HIS_MISS.with(|x| x.fetch_add(miss, Ordering::AcqRel));
                 };
             }
         }
@@ -866,11 +805,12 @@ mod bench {
             let taken = clock.elapsed()?;
             #[cfg(feature = "hit_miss")]
             eprintln!(
-                "Result in {}ms with {} lines and {} cities, on average of {:.3}ns/line, hit-miss {:.3}%",
+                "Result in {}ms with {} lines and {} cities, on average of {:.3}ns/line, hit-miss {} miss-ratio {:.3}%",
                 (taken.as_micros() as f64 / 1_000_f64).format(3),
                 self.0.0.1.format(0),
                 self.0.0.0.len().format(0),
                 taken.as_nanos() as f64 / self.0.0.1.max(1) as f64 * self.0.1 as f64,
+                self.0.0.2.format(0),
                 self.0.0.2 as f64 * 100_f64 / self.0.0.1.max(1) as f64
             );
             #[cfg(not(feature = "hit_miss"))]
@@ -905,10 +845,7 @@ mod bench {
                     2 => decode_lines_c(part, &mut cities, dry_run),
                     _ => 0,
                 };
-                let miss = HIS_MISS.with(|x| {
-                    x.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |_| Some(0))
-                        .unwrap()
-                });
+                let miss = HIS_MISS.with(|x| x.take());
                 if dry_run {
                     eprintln!(
                         "{:?} -> decode {} lines within {}ms, mode: {mode}",
@@ -1033,14 +970,14 @@ mod bench {
         fn fill_unaligned(&mut self, unaligned: *const u8) -> bool {
             let mut cache_length = 0;
             let mut data_ptr = self.data_ptr;
-            let cache_ptr = self.cache.as_mut_ptr();
+            let cache = &mut self.cache;
             let chr = self.chr;
             while data_ptr < unaligned {
-                if get!(data_ptr) == chr {
-                    set!(cache_ptr, cache_length, data_ptr);
+                if read!(data_ptr) == chr {
+                    cache[cache_length] = data_ptr;
                     cache_length += 1;
                 }
-                data_ptr = ptr_add!(data_ptr, 1);
+                ptr_inc!(data_ptr, 1);
             }
             self.cache_length = cache_length;
             self.data_ptr = data_ptr;
@@ -1050,23 +987,19 @@ mod bench {
         fn fill(&mut self) -> bool {
             let mut cache_length = 0;
             let mut data_ptr = self.data_ptr;
-            let cache_ptr = self.cache.as_mut_ptr();
+            let cache = &mut self.cache;
             let data_align = self.data_align;
             let mask = self.mask;
             while (cache_length == 0) & (data_ptr < data_align) {
-                let value = mask ^ get!(data_ptr.cast::<FindSimd>());
+                let value = mask ^ read!(data_ptr.cast::<FindSimd>());
                 for mut x in ((value - FIND_MASK1) & !value & FIND_MASK2).to_array() {
                     while x != 0 {
                         let v = x.trailing_zeros();
                         x ^= 1 << v;
-                        set!(
-                            cache_ptr,
-                            cache_length,
-                            ptr_add!(data_ptr, (v >> 3) as usize)
-                        );
+                        cache[cache_length] = ptr_add!(data_ptr, (v >> 3) as usize);
                         cache_length += 1;
                     }
-                    data_ptr = ptr_add!(data_ptr, BASE_SIZE);
+                    ptr_inc!(data_ptr, BASE_SIZE);
                 }
             }
             self.data_ptr = data_ptr;
@@ -1079,10 +1012,10 @@ mod bench {
             let cache_offset = self.cache_offset;
             if self.cache_length > cache_offset {
                 self.cache_offset += 1;
-                get!(self.cache.as_ptr(), cache_offset)
+                self.cache[cache_offset]
             } else if self.fill() {
                 self.cache_offset = 1;
-                get!(self.cache.as_ptr())
+                self.cache[0]
             } else {
                 null()
             }
@@ -1131,11 +1064,11 @@ mod bench {
                 let mut comma = commas.next();
                 let city = { mid_slice!(newline, null_check!(comma)) };
                 let value = {
-                    comma = ptr_add!(comma, 1);
+                    ptr_inc!(comma, 1);
                     newline = newlines.next();
                     mid_slice!(comma, null_check!(newline))
                 };
-                newline = ptr_add!(newline, 1);
+                ptr_inc!(newline, 1);
                 f((city.into(), parse_number(value)));
                 total += 1;
             }
@@ -1158,7 +1091,7 @@ mod bench {
     }
 
     macro_rules! find_simd_mask {
-        ($chr:expr, $mask: expr, $pos_ptr:expr, $data_ptr:expr, $end_ptr: expr) => {{
+        ($chr:expr, $mask: expr, $cache:expr, $data_ptr:expr, $end_ptr: expr) => {{
             // boost performance with simd
             let (mut count, last) = (0, ptr_add!($end_ptr, -(FIND_SIZE as isize)));
             while $data_ptr <= last {
@@ -1167,21 +1100,21 @@ mod bench {
                     while x != 0 {
                         let v = x.trailing_zeros();
                         x ^= 1 << v;
-                        set!($pos_ptr, count, ptr_add!($data_ptr, (v >> 3) as usize));
+                        $cache[count] = ptr_add!($data_ptr, (v >> 3) as usize);
                         count += 1;
                     }
-                    $data_ptr = ptr_add!($data_ptr, BASE_SIZE);
+                    ptr_inc!($data_ptr, BASE_SIZE);
                 }
                 if count != 0 {
                     return count;
                 }
             }
             while $data_ptr < $end_ptr {
-                if get!($data_ptr) == $chr {
-                    set!($pos_ptr, count, $data_ptr);
+                if read!($data_ptr) == $chr {
+                    $cache[count] = $data_ptr;
                     count += 1;
                 }
-                $data_ptr = ptr_add!($data_ptr, 1)
+                ptr_inc!($data_ptr, 1)
             }
             count
         }};
@@ -1192,11 +1125,11 @@ mod bench {
             #[inline(always)]
             #[allow(unused_unsafe)]
             pub fn $name(
-                pos_ptr: *mut *const u8,
+                cache: &mut [*const u8],
                 mut data_ptr: *const u8,
                 end_ptr: *const u8,
             ) -> usize {
-                unsafe { find_simd_mask!($chr, $mask, pos_ptr, data_ptr, end_ptr) }
+                unsafe { find_simd_mask!($chr, $mask, cache, data_ptr, end_ptr) }
             }
         };
     }
@@ -1215,19 +1148,17 @@ mod bench {
             }
             let mut commas = [null(); SIMD_SOLTS];
             let mut newlns = [null(); SIMD_SOLTS];
-            let cma_ptr = commas.as_mut_ptr();
-            let nls_ptr = newlns.as_mut_ptr();
             let mut newline = data.as_ptr();
             let end = ptr_add!(newline, data.len());
             let mut total = 0u64;
             macro_rules! pipeline {
                 ($i:expr) => {{
-                    let mut comma = get!(cma_ptr, $i);
+                    let mut comma = commas[$i];
                     let city = mid_slice!(newline, comma);
-                    newline = get!(nls_ptr, $i);
-                    comma = ptr_add!(comma, 1);
+                    newline = newlns[$i];
+                    ptr_inc!(comma, 1);
                     let value = mid_slice!(comma, newline);
-                    newline = ptr_add!(newline, 1);
+                    ptr_inc!(newline, 1);
                     f((city.into(), parse_number(value)));
                 }};
             }
@@ -1237,8 +1168,8 @@ mod bench {
                 };
             }
             loop {
-                let mut count = find_comma_simd(cma_ptr, newline, end);
-                count = count.min(find_newline_simd(nls_ptr, ptr_add!(get!(cma_ptr), 1), end));
+                let mut count = find_comma_simd(&mut commas, newline, end);
+                count = count.min(find_newline_simd(&mut newlns, ptr_add!(commas[0], 1), end));
                 total += match count {
                     0 => {
                         break total;
@@ -1279,13 +1210,13 @@ mod bench {
                 if value != 0 {
                     return ptr_add!($data_ptr, (value.trailing_zeros() >> 3) as usize);
                 }
-                $data_ptr = ptr_add!($data_ptr, BASE_SIZE);
+                ptr_inc!($data_ptr, BASE_SIZE);
             }
             while $data_ptr < $end_ptr {
-                if get!($data_ptr) == $chr {
+                if read!($data_ptr) == $chr {
                     return $data_ptr;
                 }
-                $data_ptr = ptr_add!($data_ptr, 1);
+                ptr_inc!($data_ptr, 1);
             }
             null()
         }};
@@ -1303,6 +1234,7 @@ mod bench {
     // define_find!(find_comma, CHR_CM, BASE_MASK_CM);
     define_find!(find_newline, CHR_NL, BASE_MASK_NL);
 
+    #[allow(unused_unsafe)]
     pub fn decode_lines_c<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
         fn for_each<'a, F>(data: &'a [u8], mut f: F) -> u64
         where
@@ -1326,7 +1258,7 @@ mod bench {
                     (value - BASE_MASK1) & !value & BASE_MASK2
                 }};
                 ($mask: expr, $i:expr) => {{
-                    let value = $mask ^ read_unaligned!(ptr_add!(head, $i), FindBase);
+                    let value = $mask ^ read_unaligned!(head, $i, FindBase);
                     (value - BASE_MASK1) & !value & BASE_MASK2
                 }};
             }
@@ -1367,27 +1299,33 @@ mod bench {
                         }
                     }};
                 }
-                step!(0);
-                step!(1);
+                // step!(0);
+                // step!(1);
+                let v0 = find!(BASE_MASK_CM, 0);
+                let v1 = find!(BASE_MASK_CM, BASE_SIZE);
+                if (v0 | v1) != 0 {
+                    let i = (v0 == 0) as usize;
+                    break_br!([v0, v1][i], i * BASE_SIZE);
+                }
                 step!(2);
                 // miss += 1;
-                head = ptr_add!(head, BASE_SIZE + BASE_SIZE + BASE_SIZE);
+                ptr_inc!(head, BASE_SIZE + BASE_SIZE + BASE_SIZE);
             }
             'next: while head < end {
-                match get!(head) {
+                match read!(head) {
                     CHR_CM => {
                         let city = slice!(head);
                         while head < end {
-                            match get!(head) {
+                            match read!(head) {
                                 CHR_NL => {
                                     let value = slice!(head);
                                     put!(city, value, 'next);
                                 }
-                                _ => head = ptr_add!(head, 1),
+                                _ => ptr_inc!(head, 1),
                             }
                         }
                     }
-                    _ => head = ptr_add!(head, 1),
+                    _ => ptr_inc!(head, 1),
                 }
             }
             // eprintln!("{:.3}%", 100f64 * miss as f64 / total as f64);
@@ -1410,30 +1348,30 @@ mod bench {
 
     #[inline(always)]
     fn parse_number(value: &[u8]) -> isize {
-        // const S_SHIFT: usize = (size_of::<isize>() << 3) - 1;
-        const TABLE_S: [usize; 2] = [0x0, usize::from_ne_bytes([0xFF; size_of::<usize>()])];
-        const TABLE_XXX: [u32; 10] = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900];
-        const TABLE_XX: [u32; 10] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90];
+        const S_SHIFT: usize = (size_of::<isize>() << 3) - 1;
+        // const TABLE_S: [usize; 2] = [0x0, usize::from_ne_bytes([0xFF; size_of::<usize>()])];
+        // const TABLE_XXX: [u32; 10] = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900];
+        // const TABLE_XX: [u32; 10] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90];
         macro_rules! lookup {
             (TABLE_S, $i: expr) => {
-                get!(TABLE_S.as_ptr(), ($i) as usize)
-                // ((($i) as isize) << S_SHIFT >> S_SHIFT) as usize
+                // TABLE_S[($i) as usize]
+                ((($i) as isize) << S_SHIFT >> S_SHIFT) as usize
             };
             (TABLE_XX, $i: expr) => {
-                get!(TABLE_XX.as_ptr(), ($i) as usize)
-                // ($i) * 10
+                // TABLE_XX[($i) as usize]
+                ($i) * 10
             };
             (TABLE_XXX, $i: expr) => {
-                get!(TABLE_XXX.as_ptr(), ($i) as usize)
-                // ($i) * 100
+                // TABLE_XXX[($i) as usize]
+                ($i) * 100
             };
         }
         let p = value.as_ptr();
         // signal bit 001(0)1101 => `-`
-        let s = (get!(p) == b'-') as usize;
+        let s = (read!(p) == b'-') as usize;
         // boost performance with swar
-        let v = u32::from_le(read_unaligned!(ptr_add!(p, s), u32) & 0x0F0F0F0F)
-            << ((s + 4 - value.len()) << 3);
+        let v =
+            u32::from_le(read_unaligned!(p, s, u32) & 0x0F0F0F0F) << ((s + 4 - value.len()) << 3);
         (((lookup!(TABLE_XXX, v << 24 >> 24) + lookup!(TABLE_XX, v << 16 >> 24) + (v >> 24))
             as usize
             ^ lookup!(TABLE_S, s))
@@ -1446,7 +1384,7 @@ mod bench {
             bench::{City, HIS_MISS, WeatherMap, decode_lines_c as decode_lines, parse_number},
             r#gen::Mmap,
         };
-        use std::{fs::File, sync::atomic::Ordering};
+        use std::fs::File;
         extern crate test;
 
         #[test]
@@ -1532,7 +1470,7 @@ mod bench {
             let mut m = WeatherMap::default();
             b.iter(|| {
                 HIS_MISS.with(|x| {
-                    x.store(0, Ordering::Relaxed);
+                    x.set(0);
                     decode_lines(&data, m.reset(), false);
                 });
             });
