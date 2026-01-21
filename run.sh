@@ -29,7 +29,7 @@ else
         shift
         for s in {1..11}; do
             time $app bench $@ > /dev/null
-            sleep 0.5s
+            sleep 0.1s
         done |& grep real | sed -e 's/real//' | sort | nl
     elif [ "$1" == 'p' ]; then
         shift

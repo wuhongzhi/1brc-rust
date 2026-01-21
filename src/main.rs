@@ -520,12 +520,6 @@ mod bench {
     }
     impl<'a> PartialEq for City<'a> {
         fn eq(&self, other: &Self) -> bool {
-            let a = self.name;
-            let b = other.name;
-            let len = a.len();
-            if len != b.len() {
-                return false;
-            }
             macro_rules! uget {
                 ($a:expr) => {
                     u64::from_le(read_unaligned!($a.as_ptr(), u64))
@@ -534,15 +528,18 @@ mod bench {
                     u64::from_le(read_unaligned!($a.as_ptr(), $i, u64))
                 };
             }
+            let a = self.name;
+            let b = other.name;
+            let len = a.len();
+            if len != b.len() {
+                return false;
+            }
             if len <= 8 {
                 let x = (8 - len) << 3;
                 (uget!(a) << x) == (uget!(b) << x)
-            } else if len <= 16 {
-                let x = (16 - len) << 3;
-                ((uget!(a, 8) << x) == (uget!(b, 8) << x)) & (uget!(a) == uget!(b))
             } else {
                 let x = len - 8;
-                (uget!(a, x) == uget!(b, x)) & (uget!(a, 8) == uget!(b, 8)) & (uget!(a) == uget!(b))
+                (uget!(a, x) == uget!(b, x)) & (uget!(a) == uget!(b))
             }
         }
     }
@@ -553,15 +550,18 @@ mod bench {
             self.name
         }
     }
+
+    type Temperature = isize;
+
     #[derive(Clone, Copy)]
     pub struct Weather {
         sum: i64,
-        count: usize,
-        min: isize,
-        max: isize,
+        count: u64,
+        min: Temperature,
+        max: Temperature,
     }
     impl Weather {
-        fn new(value: isize) -> Self {
+        fn new(value: Temperature) -> Self {
             Self {
                 min: value,
                 max: value,
@@ -581,8 +581,8 @@ mod bench {
             buf.extend_from_slice((self.max as f64 / 10f64).format(1).as_bytes());
         }
     }
-    impl From<isize> for Weather {
-        fn from(value: isize) -> Self {
+    impl From<Temperature> for Weather {
+        fn from(value: Temperature) -> Self {
             Self::new(value)
         }
     }
@@ -607,9 +607,9 @@ mod bench {
             min_val!(self, other.min);
         }
     }
-    impl AddAssign<isize> for Weather {
+    impl AddAssign<Temperature> for Weather {
         #[inline(always)]
-        fn add_assign(&mut self, value: isize) {
+        fn add_assign(&mut self, value: Temperature) {
             self.sum += value as i64;
             self.count += 1;
             max_val!(self, value);
@@ -734,35 +734,38 @@ mod bench {
         }
         // TODO: refine this method
         #[inline(always)]
-        pub fn put(&mut self, (key, value): (City<'a>, isize)) {
+        pub fn put(&mut self, (key, value): (City<'a>, Temperature)) {
+            macro_rules! get_mut_ref {
+                ($e:expr, $i:expr) => {
+                    unsafe { &mut *$e.add($i) }
+                };
+            }
             #[inline(always)]
             fn hash(index: u64) -> usize {
                 ((index >> 45) ^ (index >> 30) ^ (index >> 15) ^ index) as usize
             }
             const MASK: usize = HASH_SIZE - 1;
             let inode = &mut self.inode;
-            let index = &mut self.index;
+            let index = &mut self.index.as_mut_ptr();
             let (mut miss, mut slot) = (0, hash(key.hash()) & MASK);
             loop {
-                let node = &mut index[slot];
+                let node = get_mut_ref!(index, slot);
                 return if *node == u16::MAX {
-                    let inode = &mut self.inode;
                     *node = inode.len() as u16;
                     inode.push(MyWeatherNode(key, value.into()));
+                } else if let node = get_mut_ref!(inode.as_mut_ptr(), *node as usize)
+                    && key.eq(&node.0)
+                {
+                    node.1 += value;
+                    #[cfg(feature = "hit_miss")]
+                    HIS_MISS.with(|x| x.set(x.get() + miss));
                 } else {
-                    let node = &mut inode[*node as usize];
-                    if key.eq(&node.0) {
-                        node.1 += value;
-                        #[cfg(feature = "hit_miss")]
-                        HIS_MISS.with(|x| x.set(x.get() + miss));
-                    } else {
-                        miss += 1;
-                        if miss < HASH_SIZE {
-                            slot = (slot + 31) & MASK;
-                            continue;
-                        }
-                        panic!("Map is full!");
+                    miss += 1;
+                    if miss < HASH_SIZE {
+                        slot = (slot + 31) & MASK;
+                        continue;
                     }
+                    panic!("Map is full!");
                 };
             }
         }
@@ -1040,7 +1043,7 @@ mod bench {
         #[inline(always)]
         fn for_each<F>(&mut self, mut f: F) -> u64
         where
-            F: FnMut((City<'a>, isize)),
+            F: FnMut((City<'a>, Temperature)),
         {
             let commas = &mut self.commas;
             let newlines = &mut self.newlines;
@@ -1139,7 +1142,7 @@ mod bench {
     pub fn decode_lines_b<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
         fn for_each<'a, F>(data: &'a [u8], mut f: F) -> u64
         where
-            F: FnMut((City<'a>, isize)),
+            F: FnMut((City<'a>, Temperature)),
         {
             macro_rules! mid_slice {
                 ($s:expr, $e:expr) => {
@@ -1238,7 +1241,7 @@ mod bench {
     pub fn decode_lines_c<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
         fn for_each<'a, F>(data: &'a [u8], mut f: F) -> u64
         where
-            F: FnMut((City<'a>, isize)),
+            F: FnMut((City<'a>, Temperature)),
         {
             let mut head = data.as_ptr();
             let mut mark = head;
@@ -1250,7 +1253,7 @@ mod bench {
                     f(($city.into(), parse_number($value)));
                     total += 1;
                     continue $label;
-                }}
+                }};
             }
             macro_rules! find {
                 ($mask: expr) => {{
@@ -1299,15 +1302,19 @@ mod bench {
                         }
                     }};
                 }
+
                 // step!(0);
                 // step!(1);
+
                 let v0 = find!(BASE_MASK_CM, 0);
                 let v1 = find!(BASE_MASK_CM, BASE_SIZE);
                 if (v0 | v1) != 0 {
+                    const OFFSET: [usize; 2] = [0, BASE_SIZE];
                     let i = (v0 == 0) as usize;
-                    break_br!([v0, v1][i], i * BASE_SIZE);
+                    break_br!([v0, v1][i], OFFSET[i]);
                 }
                 step!(2);
+
                 // miss += 1;
                 ptr_inc!(head, BASE_SIZE + BASE_SIZE + BASE_SIZE);
             }
@@ -1347,7 +1354,7 @@ mod bench {
     }
 
     #[inline(always)]
-    fn parse_number(value: &[u8]) -> isize {
+    fn parse_number(value: &[u8]) -> Temperature {
         const S_SHIFT: usize = (size_of::<isize>() << 3) - 1;
         // const TABLE_S: [usize; 2] = [0x0, usize::from_ne_bytes([0xFF; size_of::<usize>()])];
         // const TABLE_XXX: [u32; 10] = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900];
@@ -1375,7 +1382,7 @@ mod bench {
         (((lookup!(TABLE_XXX, v << 24 >> 24) + lookup!(TABLE_XX, v << 16 >> 24) + (v >> 24))
             as usize
             ^ lookup!(TABLE_S, s))
-            + s) as isize
+            + s) as Temperature
     }
 
     #[cfg(test)]
