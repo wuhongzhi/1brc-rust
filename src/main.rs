@@ -455,16 +455,8 @@ mod bench {
     use proc_cpuinfo::CpuInfo;
     use rayon::prelude::*;
     use std::{
-        cell::Cell,
-        collections::BTreeMap,
-        fmt::Display,
-        fs::File,
-        io::Write,
-        mem::ManuallyDrop,
-        ops::{AddAssign, Deref},
-        ptr::null,
-        thread,
-        time::SystemTime,
+        cell::Cell, collections::BTreeMap, fmt::Display, fs::File, io::Write, mem::ManuallyDrop,
+        ops::AddAssign, ptr::null, thread, time::SystemTime,
     };
 
     macro_rules! read {
@@ -483,34 +475,26 @@ mod bench {
     #[repr(transparent)]
     #[derive(Clone, Copy, PartialOrd, Ord, Eq)]
     pub struct City<'a> {
-        pub name: &'a [u8],
+        name: &'a [u8],
     }
     impl<'a> City<'a> {
-        pub fn new(name: &'a [u8]) -> Self {
-            Self { name }
-        }
         pub fn write(&self, buf: &mut Vec<u8>) {
             buf.extend_from_slice(self.name);
         }
+        fn new(name: &'a [u8]) -> Self {
+            Self { name }
+        }
         #[inline(always)]
         fn hash(&self) -> u64 {
-            const TABLE: [u64; 8] = [
-                0x2020202020202020,
-                0x20202020202020 << 8,
-                0x202020202020 << 16,
-                0x2020202020 << 24,
-                0x20202020 << 32,
-                0x202020 << 40,
-                0x2020 << 48,
-                0x20 << 56,
-            ];
-
             let a = self.name;
             let l = a.len();
-            let s = ((l < 8) as usize) * (8 - (l & 0x7));
-            // first 8 bytes(move to hight is less than 8 bytes) ^ last 2 bytes
-            ((u64::from_le(read_unaligned!(a.as_ptr(), u64)) << (s << 3)) - TABLE[s])
-                ^ (u16::from_le(read_unaligned!(a.as_ptr(), l - 2, u16)) - 0x2020) as u64
+            let mut v0 = u64::from_le(read_unaligned!(a.as_ptr(), u64));
+            (if l <= 8 {
+                v0 <<= (((l < 8) as usize) * (8 - (l & 0x7))) << 3;
+                v0.swap_bytes()
+            } else {
+                u64::from_le(read_unaligned!(a.as_ptr(), l - 8, u64))
+            }) ^ v0
         }
     }
     impl<'a> From<&'a [u8]> for City<'a> {
@@ -531,23 +515,14 @@ mod bench {
             let a = self.name;
             let b = other.name;
             let len = a.len();
-            if len != b.len() {
-                return false;
-            }
-            if len <= 8 {
-                let x = (8 - len) << 3;
-                (uget!(a) << x) == (uget!(b) << x)
-            } else {
-                let x = len - 8;
-                (uget!(a, x) == uget!(b, x)) & (uget!(a) == uget!(b))
-            }
-        }
-    }
-    impl<'a> Deref for City<'a> {
-        type Target = [u8];
-
-        fn deref(&self) -> &Self::Target {
-            self.name
+            len == b.len()
+                && if len > 8 {
+                    let x = len - 8;
+                    (uget!(a, x) == uget!(b, x)) & (uget!(a) == uget!(b))
+                } else {
+                    let x = (8 - len) << 3;
+                    (uget!(a) << x) == (uget!(b) << x)
+                }
         }
     }
 
@@ -555,8 +530,8 @@ mod bench {
 
     #[derive(Clone, Copy)]
     pub struct Weather {
-        sum: i64,
         count: u64,
+        sum: i64,
         min: Temperature,
         max: Temperature,
     }
@@ -747,7 +722,7 @@ mod bench {
             const MASK: usize = HASH_SIZE - 1;
             let inode = &mut self.inode;
             let index = &mut self.index.as_mut_ptr();
-            let (mut miss, mut slot) = (0, hash(key.hash()) & MASK);
+            let (mut miss, mut slot) = (0, hash(key.hash() >> 4) & MASK);
             loop {
                 let node = get_mut_ref!(index, slot);
                 return if *node == u16::MAX {
@@ -1246,7 +1221,7 @@ mod bench {
             let mut head = data.as_ptr();
             let mut mark = head;
             let end = ptr_add!(head, data.len());
-            let last = ptr_add!(end, -((FIND_SIZE * 3) as isize));
+            let last = ptr_add!(end, -((BASE_SIZE * 8) as isize));
             let mut total = 0u64;
             macro_rules! put {
                 ($city:expr, $value: expr, $label:lifetime) => {{
@@ -1284,7 +1259,8 @@ mod bench {
                     ptr_add!(head, $i + ($value.trailing_zeros() >> 3) as usize)
                 };
             }
-            // let mut miss = 0;
+            #[cfg(feature = "hit_miss")]
+            let mut miss = 0;
             'next: while head <= last {
                 macro_rules! break_br {
                     ($v: expr, $i: expr) => {{
@@ -1295,28 +1271,26 @@ mod bench {
                     }};
                 }
                 macro_rules! step {
-                    ($i:expr) => {{
-                        let v = find!(BASE_MASK_CM, $i * BASE_SIZE);
-                        if v != 0 {
-                            break_br!(v, $i * BASE_SIZE);
+                    ($offset:expr) => {{
+                        let v0 = find!(BASE_MASK_CM, $offset);
+                        let v1 = find!(BASE_MASK_CM, $offset + BASE_SIZE);
+                        if (v0 | v1) != 0 {
+                            const OFFSET: [usize; 2] = [$offset, $offset + BASE_SIZE];
+                            let i = (v0 == 0) as usize;
+                            break_br!([v0, v1][i], OFFSET[i]);
                         }
                     }};
                 }
+                step!(0);
+                step!(BASE_SIZE * 2);
+                step!(BASE_SIZE * 4);
+                step!(BASE_SIZE * 6);
 
-                // step!(0);
-                // step!(1);
-
-                let v0 = find!(BASE_MASK_CM, 0);
-                let v1 = find!(BASE_MASK_CM, BASE_SIZE);
-                if (v0 | v1) != 0 {
-                    const OFFSET: [usize; 2] = [0, BASE_SIZE];
-                    let i = (v0 == 0) as usize;
-                    break_br!([v0, v1][i], OFFSET[i]);
+                #[cfg(feature = "hit_miss")]
+                {
+                    miss += 1;
                 }
-                step!(2);
-
-                // miss += 1;
-                ptr_inc!(head, BASE_SIZE + BASE_SIZE + BASE_SIZE);
+                ptr_inc!(head, BASE_SIZE * 8);
             }
             'next: while head < end {
                 match read!(head) {
@@ -1335,7 +1309,14 @@ mod bench {
                     _ => ptr_inc!(head, 1),
                 }
             }
-            // eprintln!("{:.3}%", 100f64 * miss as f64 / total as f64);
+            #[cfg(feature = "hit_miss")]
+            {
+                eprintln!(
+                    "{:?} {:.3}%",
+                    thread::current().id(),
+                    100f64 * miss as f64 / total as f64
+                );
+            }
             total
         }
         if dry_run {
@@ -1388,10 +1369,10 @@ mod bench {
     #[cfg(test)]
     pub mod tests {
         use crate::{
-            bench::{City, HIS_MISS, WeatherMap, decode_lines_c as decode_lines, parse_number},
+            bench::{HIS_MISS, WeatherMap, decode_lines_c as decode_lines, parse_number},
             r#gen::Mmap,
         };
-        use std::fs::File;
+        use std::{env::args, fs::File};
         extern crate test;
 
         #[test]
@@ -1412,7 +1393,7 @@ mod bench {
             let mut m = WeatherMap::default();
             decode_lines(data, &mut m, false);
             assert_eq!(m.len(), 2);
-            let r = m.get(&City::new("aaaaaaaaa".as_bytes())).unwrap();
+            let r = m.get(&"aaaaaaaaa".as_bytes().into()).unwrap();
             assert_eq!(r.count, 2);
             assert_eq!(r.min, -100);
             assert_eq!(r.max, 260);
@@ -1475,10 +1456,11 @@ mod bench {
         fn bench_reduce(b: &mut test::Bencher) {
             let data = Mmap::open::<false>(File::open("./data/measurements.txt").unwrap()).unwrap();
             let mut m = WeatherMap::default();
+            let dry_run = args().any(|x| x == "-dry-run" || x == "-d");
             b.iter(|| {
                 HIS_MISS.with(|x| {
                     x.set(0);
-                    decode_lines(&data, m.reset(), false);
+                    decode_lines(&data, m.reset(), dry_run);
                 });
             });
         }
