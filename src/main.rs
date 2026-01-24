@@ -472,38 +472,17 @@ mod bench {
             unsafe { ptr_add!($p, $i).cast::<$ty>().read_unaligned() }
         };
     }
-    #[repr(transparent)]
     #[derive(Clone, Copy, PartialOrd, Ord, Eq)]
     pub struct City<'a> {
         name: &'a [u8],
+        first: u64,
+        last: u64,
     }
     impl<'a> City<'a> {
         pub fn write(&self, buf: &mut Vec<u8>) {
             buf.extend_from_slice(self.name);
         }
         fn new(name: &'a [u8]) -> Self {
-            Self { name }
-        }
-        #[inline(always)]
-        fn hash(&self) -> u64 {
-            let a = self.name;
-            let l = a.len();
-            let mut v0 = u64::from_le(read_unaligned!(a.as_ptr(), u64));
-            (if l <= 8 {
-                v0 <<= (((l < 8) as usize) * (8 - (l & 0x7))) << 3;
-                v0.swap_bytes()
-            } else {
-                u64::from_le(read_unaligned!(a.as_ptr(), l - 8, u64))
-            }) ^ v0
-        }
-    }
-    impl<'a> From<&'a [u8]> for City<'a> {
-        fn from(value: &'a [u8]) -> Self {
-            Self::new(value)
-        }
-    }
-    impl<'a> PartialEq for City<'a> {
-        fn eq(&self, other: &Self) -> bool {
             macro_rules! uget {
                 ($a:expr) => {
                     u64::from_le(read_unaligned!($a.as_ptr(), u64))
@@ -512,17 +491,41 @@ mod bench {
                     u64::from_le(read_unaligned!($a.as_ptr(), $i, u64))
                 };
             }
-            let a = self.name;
-            let b = other.name;
-            let len = a.len();
-            len == b.len()
-                && if len > 8 {
-                    let x = len - 8;
-                    (uget!(a, x) == uget!(b, x)) & (uget!(a) == uget!(b))
-                } else {
-                    let x = (8 - len) << 3;
-                    (uget!(a) << x) == (uget!(b) << x)
+            let len = name.len();
+            if len <= 8 {
+                let x = (8 - len) << 3;
+                let word = uget!(name) << x;
+                Self {
+                    name,
+                    first: word,
+                    last: word.swap_bytes(),
                 }
+            } else {
+                let x = len - 8;
+                Self {
+                    name,
+                    first: uget!(name),
+                    last: uget!(name, x),
+                }
+            }
+        }
+        #[inline(always)]
+        fn hash(&self) -> u64 {
+            self.first ^ self.last
+        }
+    }
+    impl<'a> From<&'a [u8]> for City<'a> {
+        fn from(value: &'a [u8]) -> Self {
+            Self::new(value)
+        }
+    }
+    impl<'a> PartialEq for City<'a> {
+        #[inline(always)]
+        fn eq(&self, other: &Self) -> bool {
+            let len = self.name.len();
+            len == other.name.len()
+                && self.first == other.first
+                && (len <= 8 || self.last == other.last)
         }
     }
 
@@ -1265,8 +1268,7 @@ mod bench {
                 macro_rules! break_br {
                     ($v: expr, $i: expr) => {{
                         let city = slice!(tzoff!($v, $i));
-                        let v = find!(BASE_MASK_NL);
-                        let value = slice!(tzoff!(v));
+                        let value = slice!(tzoff!(find!(BASE_MASK_NL)));
                         put!(city, value, 'next);
                     }};
                 }
@@ -1275,9 +1277,8 @@ mod bench {
                         let v0 = find!(BASE_MASK_CM, $offset);
                         let v1 = find!(BASE_MASK_CM, $offset + BASE_SIZE);
                         if (v0 | v1) != 0 {
-                            const OFFSET: [usize; 2] = [$offset, $offset + BASE_SIZE];
                             let i = (v0 == 0) as usize;
-                            break_br!([v0, v1][i], OFFSET[i]);
+                            break_br!([v0, v1][i], [$offset, $offset + BASE_SIZE][i]);
                         }
                     }};
                 }
