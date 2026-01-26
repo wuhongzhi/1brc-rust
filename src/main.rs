@@ -475,8 +475,7 @@ mod bench {
     #[derive(Clone, Copy, PartialOrd, Ord, Eq)]
     pub struct City<'a> {
         name: &'a [u8],
-        first: u64,
-        last: u64,
+        words: (u64, u64),
     }
     impl<'a> City<'a> {
         pub fn write(&self, buf: &mut Vec<u8>) {
@@ -492,26 +491,23 @@ mod bench {
                 };
             }
             let len = name.len();
-            if len <= 8 {
-                let x = (8 - len) << 3;
-                let word = uget!(name) << x;
-                Self {
-                    name,
-                    first: word,
-                    last: word.swap_bytes(),
-                }
-            } else {
-                let x = len - 8;
-                Self {
-                    name,
-                    first: uget!(name),
-                    last: uget!(name, x),
-                }
+            Self {
+                name,
+                words: {
+                    if len <= 8 {
+                        let x = (8 - len) << 3;
+                        let word = uget!(name) << x;
+                        (word, word.swap_bytes())
+                    } else {
+                        let x = len - 8;
+                        (uget!(name), uget!(name, x))
+                    }
+                },
             }
         }
         #[inline(always)]
         fn hash(&self) -> u64 {
-            self.first ^ self.last
+            self.words.0 ^ self.words.1
         }
     }
     impl<'a> From<&'a [u8]> for City<'a> {
@@ -522,10 +518,7 @@ mod bench {
     impl<'a> PartialEq for City<'a> {
         #[inline(always)]
         fn eq(&self, other: &Self) -> bool {
-            let len = self.name.len();
-            len == other.name.len()
-                && self.first == other.first
-                && (len <= 8 || self.last == other.last)
+            (self.name.len() == other.name.len()) & (self.words == other.words)
         }
     }
 
@@ -728,22 +721,23 @@ mod bench {
             let (mut miss, mut slot) = (0, hash(key.hash() >> 4) & MASK);
             loop {
                 let node = get_mut_ref!(index, slot);
-                return if *node == u16::MAX {
+                return if *node != u16::MAX {
+                    let node = get_mut_ref!(inode.as_mut_ptr(), *node as usize);
+                    if key.eq(&node.0) {
+                        node.1 += value;
+                        #[cfg(feature = "hit_miss")]
+                        HIS_MISS.with(|x| x.set(x.get() + miss));
+                    } else {
+                        miss += 1;
+                        if miss < HASH_SIZE {
+                            slot = (slot + 31) & MASK;
+                            continue;
+                        }
+                        panic!("Map is full!");
+                    }
+                } else {
                     *node = inode.len() as u16;
                     inode.push(MyWeatherNode(key, value.into()));
-                } else if let node = get_mut_ref!(inode.as_mut_ptr(), *node as usize)
-                    && key.eq(&node.0)
-                {
-                    node.1 += value;
-                    #[cfg(feature = "hit_miss")]
-                    HIS_MISS.with(|x| x.set(x.get() + miss));
-                } else {
-                    miss += 1;
-                    if miss < HASH_SIZE {
-                        slot = (slot + 31) & MASK;
-                        continue;
-                    }
-                    panic!("Map is full!");
                 };
             }
         }
@@ -1226,59 +1220,41 @@ mod bench {
             let end = ptr_add!(head, data.len());
             let last = ptr_add!(end, -((BASE_SIZE * 8) as isize));
             let mut total = 0u64;
-            macro_rules! put {
-                ($city:expr, $value: expr, $label:lifetime) => {{
-                    f(($city.into(), parse_number($value)));
-                    total += 1;
-                    continue $label;
-                }};
-            }
-            macro_rules! find {
-                ($mask: expr) => {{
-                    let value = $mask ^ read_unaligned!(head, FindBase);
-                    (value - BASE_MASK1) & !value & BASE_MASK2
-                }};
-                ($mask: expr, $i:expr) => {{
-                    let value = $mask ^ read_unaligned!(head, $i, FindBase);
-                    (value - BASE_MASK1) & !value & BASE_MASK2
-                }};
-            }
-            macro_rules! slice {
-                ($value: expr) => {
-                    unsafe {
-                        let i = $value;
-                        let r = slice::from_raw_parts(mark, (i as usize) - (mark as usize));
-                        mark = ptr_add!(i, 1);
-                        head = mark;
-                        r
-                    }
-                };
-            }
-            macro_rules! tzoff {
-                ($value:expr) => {
-                    ptr_add!(head, ($value.trailing_zeros() >> 3) as usize)
-                };
-                ($value:expr, $i: expr) => {
-                    ptr_add!(head, $i + ($value.trailing_zeros() >> 3) as usize)
-                };
-            }
             #[cfg(feature = "hit_miss")]
             let mut miss = 0;
             'next: while head <= last {
-                macro_rules! break_br {
-                    ($v: expr, $i: expr) => {{
-                        let city = slice!(tzoff!($v, $i));
-                        let value = slice!(tzoff!(find!(BASE_MASK_NL)));
-                        put!(city, value, 'next);
+                macro_rules! find {
+                    ($mask: expr, $input: expr) => {{
+                        let value = $mask ^ $input;
+                        (value - BASE_MASK1) & !value & BASE_MASK2
                     }};
                 }
                 macro_rules! step {
-                    ($offset:expr) => {{
-                        let v0 = find!(BASE_MASK_CM, $offset);
-                        let v1 = find!(BASE_MASK_CM, $offset + BASE_SIZE);
-                        if (v0 | v1) != 0 {
-                            let i = (v0 == 0) as usize;
-                            break_br!([v0, v1][i], [$offset, $offset + BASE_SIZE][i]);
+                    ($i: expr) => {{
+                        let tz0 = find!(BASE_MASK_CM, read_unaligned!(head, $i, FindBase));
+                        let tz1 = find!(
+                            BASE_MASK_CM,
+                            read_unaligned!(head, $i + BASE_SIZE, FindBase)
+                        );
+                        if (tz0 | tz1) != 0 {
+                            let i = (tz0 == 0) as usize;
+                            let off =
+                                [$i, BASE_SIZE][i] + ([tz0, tz1][i].trailing_zeros() >> 3) as usize;
+                            let len = (head as usize - mark as usize) + off;
+                            let name = unsafe { slice::from_raw_parts(mark, len) };
+                            ptr_inc!(head, off + 1);
+                            let tz2 = find!(BASE_MASK_NL, read_unaligned!(head, FindBase));
+                            let len = (tz2.trailing_zeros() >> 3) as usize;
+                            let value = unsafe { slice::from_raw_parts(head, len) };
+                            ptr_inc!(head, len + 1);
+                            mark = head;
+                            f((name.into(), parse_number(value)));
+                            total += 1;
+                            continue 'next;
+                        }
+                        #[cfg(feature = "hit_miss")]
+                        {
+                            miss += 1;
                         }
                     }};
                 }
@@ -1286,22 +1262,29 @@ mod bench {
                 step!(BASE_SIZE * 2);
                 step!(BASE_SIZE * 4);
                 step!(BASE_SIZE * 6);
-
-                #[cfg(feature = "hit_miss")]
-                {
-                    miss += 1;
-                }
                 ptr_inc!(head, BASE_SIZE * 8);
             }
             'next: while head < end {
+                macro_rules! slice {
+                    () => {
+                        unsafe {
+                            let r = slice::from_raw_parts(mark, head as usize - mark as usize);
+                            ptr_inc!(head, 1);
+                            mark = head;
+                            r
+                        }
+                    };
+                }
                 match read!(head) {
                     CHR_CM => {
-                        let city = slice!(head);
+                        let city = slice!();
                         while head < end {
                             match read!(head) {
                                 CHR_NL => {
-                                    let value = slice!(head);
-                                    put!(city, value, 'next);
+                                    let value = slice!();
+                                    f((city.into(), parse_number(value)));
+                                    total += 1;
+                                    continue 'next;
                                 }
                                 _ => ptr_inc!(head, 1),
                             }
@@ -1337,34 +1320,19 @@ mod bench {
 
     #[inline(always)]
     fn parse_number(value: &[u8]) -> Temperature {
-        const S_SHIFT: usize = (size_of::<isize>() << 3) - 1;
-        // const TABLE_S: [usize; 2] = [0x0, usize::from_ne_bytes([0xFF; size_of::<usize>()])];
-        // const TABLE_XXX: [u32; 10] = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900];
-        // const TABLE_XX: [u32; 10] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90];
-        macro_rules! lookup {
-            (TABLE_S, $i: expr) => {
-                // TABLE_S[($i) as usize]
-                ((($i) as isize) << S_SHIFT >> S_SHIFT) as usize
-            };
-            (TABLE_XX, $i: expr) => {
-                // TABLE_XX[($i) as usize]
-                ($i) * 10
-            };
-            (TABLE_XXX, $i: expr) => {
-                // TABLE_XXX[($i) as usize]
-                ($i) * 100
-            };
+        macro_rules! sign {
+            ($v:expr, $i: expr) => {{
+                const S_SHIFT: usize = (size_of::<i64>() << 3) - 1;
+                (($v) ^ ((($i) as i64) << S_SHIFT >> S_SHIFT) as u64) + $i as u64
+            }};
         }
-        let p = value.as_ptr();
-        // signal bit 001(0)1101 => `-`
-        let s = (read!(p) == b'-') as usize;
-        // boost performance with swar
-        let v =
-            u32::from_le(read_unaligned!(p, s, u32) & 0x0F0F0F0F) << ((s + 4 - value.len()) << 3);
-        (((lookup!(TABLE_XXX, v << 24 >> 24) + lookup!(TABLE_XX, v << 16 >> 24) + (v >> 24))
-            as usize
-            ^ lookup!(TABLE_S, s))
-            + s) as Temperature
+        let sign = (read!(value.as_ptr()) == b'-') as usize;
+        let value = u32::from_le(read_unaligned!(value.as_ptr(), sign, u32))
+            << ((sign + 4 - value.len()) << 3);
+        sign!(
+            ((((value & 0x0F000F0F) as u64).wrapping_mul(0x640A000100) >> 32) & 0x3FF),
+            sign
+        ) as Temperature
     }
 
     #[cfg(test)]
@@ -1463,6 +1431,28 @@ mod bench {
                     x.set(0);
                     decode_lines(&data, m.reset(), dry_run);
                 });
+            });
+        }
+
+        #[bench]
+        #[ignore]
+        fn bench_mmap(b: &mut test::Bencher) {
+            let data = Mmap::open::<false>(File::open("./data/measurements.txt").unwrap()).unwrap();
+            b.iter(|| {
+                let len = data.len();
+                let mut data_ptr = data.as_ptr();
+                let data_end = unsafe { data_ptr.add(len) };
+                let data_last = unsafe { data_ptr.add(len - 8) };
+                let mut x = 0;
+                while data_ptr < data_last {
+                    x ^= unsafe { *data_ptr.cast::<u64>() };
+                    data_ptr = unsafe { data_ptr.add(size_of::<u64>()) };
+                }
+                while data_ptr < data_end {
+                    x ^= unsafe { *data_ptr } as u64;
+                    data_ptr = unsafe { data_ptr.add(1) };
+                }
+                println!("{x}");
             });
         }
     }
