@@ -26,6 +26,7 @@ Options:
       --template <TEMPLATE>  template file [default: ./data/weather_stations.csv]
       --data <DATA>          data file [default: ./data/measurements.txt]
   -l, --legacy               write data line by line
+      --hugepages            data file in hugetlbfs
   -h, --help                 Print help
 ```
 
@@ -40,5 +41,6 @@ Options:
   -w, --workers <WORKERS>  parallel workers, default to cpu cores
   -d, --dry-run            dry-run without map/reduce
   -m, --mode <MODE>        mode (0: simd-scan, 1: simd-batch, 2: simd-sequence) [default: 2]
+      --hugepages          data file in hugetlbfs
   -h, --help               Print help
 ```

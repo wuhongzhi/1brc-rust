@@ -80,6 +80,10 @@ struct GenerateArg {
     /// write data line by line
     #[arg(short, long)]
     legacy: bool,
+
+    /// data file in hugetlbfs
+    #[arg(long)]
+    hugepages: bool,
 }
 fn max_cities(s: &str) -> Result<usize> {
     Ok(s.parse::<usize>()?.clamp(1, 10_000))
@@ -105,6 +109,10 @@ struct BenchArg {
     /// mode (0: simd-scan, 1: simd-batch, 2: simd-sequence)
     #[arg(short, long, default_value_t = 2)]
     mode: usize,
+
+    /// data file in hugetlbfs
+    #[arg(long)]
+    hugepages: bool,
 }
 
 pub fn main() -> Result<()> {
@@ -115,6 +123,7 @@ pub fn main() -> Result<()> {
             slice: None,
             workers: None,
             dry_run: false,
+            hugepages: false,
             mode: 2,
         })
     } else {
@@ -201,7 +210,7 @@ fn generate(argv: GenerateArg) -> Result<()> {
             file.flush()?;
             file.seek(SeekFrom::End(0))? as f64
         } else {
-            let mut file = Mmap::open::<true>(file)?;
+            let mut file = Mmap::open::<true>(file, argv.hugepages)?;
             lines!(file);
             file.flush()?;
             file.finish() as f64
@@ -238,7 +247,7 @@ fn bench(argv: BenchArg) -> Result<()> {
             reader.read_to_end(&mut buf)?;
             stdout().write_all(&buf)?;
         }
-        Fork::Child => match Mmap::open::<false>(File::open(argv.data)?) {
+        Fork::Child => match Mmap::open::<false>(File::open(argv.data)?, argv.hugepages) {
             Ok(data) => {
                 bench::reduce(&data, argv.slice, argv.workers, argv.dry_run, argv.mode)?
                     .write(unsafe { File::from_raw_fd(pipe_fds[1]) }, new_buf())?
@@ -324,14 +333,15 @@ mod r#gen {
         length: u64,
         write: bool,
         inner: RawData,
+        hugepages: bool,
     }
 
     impl Mmap {
-        pub fn open<const WRITE: bool>(file: File) -> Result<Self> {
+        pub fn open<const WRITE: bool>(file: File, hugepages: bool) -> Result<Self> {
             let length = file.metadata()?.len() as _;
             let write = WRITE;
             if write {
-                let mut chunk = 64 * 1024;
+                let mut chunk = 16 * 1024;
                 unsafe {
                     let page_size = libc::sysconf(libc::_SC_PAGESIZE);
                     if page_size == -1 {
@@ -346,6 +356,7 @@ mod r#gen {
                     offset: 0,
                     length,
                     write,
+                    hugepages,
                     inner: RawData::default(),
                 })
             } else {
@@ -357,14 +368,20 @@ mod r#gen {
                     chunk = length as usize
                 }
                 let offset = 0u64;
-                let ptr = mmap::<false>(&file, chunk, offset)?;
+                let ptr = mmap::<false>(&file, chunk, offset, hugepages)?;
+                let length = if hugepages {
+                    unsafe { *ptr.add(chunk - 8).cast::<u64>() }.to_le()
+                } else {
+                    length
+                };
                 Ok(Self {
                     file,
                     chunk,
                     offset,
                     length,
                     write,
-                    inner: RawData::new(ptr, chunk, chunk),
+                    hugepages,
+                    inner: RawData::new(ptr, length as usize, chunk),
                 })
             }
         }
@@ -372,8 +389,20 @@ mod r#gen {
     impl Mmap {
         pub fn finish(&mut self) -> u64 {
             if self.write {
-                self.length = self.offset + self.inner.len() as u64;
-                self.file.set_len(self.length).unwrap();
+                self.write = false;
+                let length = self.offset + self.inner.len() as u64;
+                if self.hugepages {
+                    if self.inner.remain() < 8 {
+                        self.next_map().unwrap();
+                    }
+                    let pos = self.inner.data.capacity() - 8;
+                    unsafe {
+                        *self.inner.ptr.add(pos).cast::<u64>() = length.to_le();
+                    }
+                } else {
+                    self.file.set_len(length).unwrap();
+                    self.length = length;
+                }
             }
             self.length
         }
@@ -383,7 +412,7 @@ mod r#gen {
             }
             self.length = self.offset + self.chunk as u64;
             self.file.set_len(self.length)?;
-            let ptr = mmap::<true>(&self.file, self.chunk, self.offset)?;
+            let ptr = mmap::<true>(&self.file, self.chunk, self.offset, self.hugepages)?;
             self.inner = RawData::new(ptr, 0, self.chunk);
 
             Ok(())
@@ -394,14 +423,19 @@ mod r#gen {
             libc::munmap(ptr as _, capacity);
         }
     }
-    fn mmap<const WRITE: bool>(file: &File, chunk: usize, offset: u64) -> std::io::Result<*mut u8> {
+    fn mmap<const WRITE: bool>(
+        file: &File,
+        chunk: usize,
+        offset: u64,
+        hugepages: bool,
+    ) -> std::io::Result<*mut u8> {
         unsafe {
             let mut ptr = std::ptr::null_mut();
             ptr = libc::mmap(
                 ptr,
                 chunk,
                 libc::PROT_READ | if WRITE { libc::PROT_WRITE } else { 0 },
-                libc::MAP_SHARED,
+                libc::MAP_SHARED | if hugepages { libc::MAP_HUGETLB } else { 0 },
                 file.as_raw_fd(),
                 offset as _,
             );
@@ -481,27 +515,22 @@ mod bench {
         pub fn write(&self, buf: &mut Vec<u8>) {
             buf.extend_from_slice(self.name);
         }
+        #[inline(always)]
         fn new(name: &'a [u8]) -> Self {
-            macro_rules! uget {
-                ($a:expr) => {
-                    u64::from_le(read_unaligned!($a.as_ptr(), u64))
-                };
-                ($a:expr, $i:expr) => {
-                    u64::from_le(read_unaligned!($a.as_ptr(), $i, u64))
-                };
-            }
-            let len = name.len();
+            Self::new_ex(name, u64::from_le(read_unaligned!(name.as_ptr(), u64)))
+        }
+        #[inline(always)]
+        fn new_ex(name: &'a [u8], mut word1: u64) -> Self {
             Self {
                 name,
-                words: {
-                    if len <= 8 {
-                        let x = (8 - len) << 3;
-                        let word = uget!(name) << x;
-                        (word, word.swap_bytes())
-                    } else {
-                        let x = len - 8;
-                        (uget!(name), uget!(name, x))
-                    }
+                words: if name.len() <= 8 {
+                    word1 <<= (8 - name.len()) << 3;
+                    (word1, word1.swap_bytes())
+                } else {
+                    (
+                        word1,
+                        u64::from_le(read_unaligned!(name.as_ptr(), name.len() - 8, u64)),
+                    )
                 },
             }
         }
@@ -518,7 +547,7 @@ mod bench {
     impl<'a> PartialEq for City<'a> {
         #[inline(always)]
         fn eq(&self, other: &Self) -> bool {
-            (self.name.len() == other.name.len()) & (self.words == other.words)
+            (self.name.len() == other.name.len()) && (self.words == other.words)
         }
     }
 
@@ -572,8 +601,8 @@ mod bench {
     impl AddAssign for Weather {
         #[inline(always)]
         fn add_assign(&mut self, other: Self) {
-            self.sum += other.sum;
             self.count += other.count;
+            self.sum += other.sum;
             max_val!(self, other.max);
             min_val!(self, other.min);
         }
@@ -581,8 +610,8 @@ mod bench {
     impl AddAssign<Temperature> for Weather {
         #[inline(always)]
         fn add_assign(&mut self, value: Temperature) {
-            self.sum += value as i64;
             self.count += 1;
+            self.sum += value as i64;
             max_val!(self, value);
             min_val!(self, value);
         }
@@ -712,13 +741,13 @@ mod bench {
                 };
             }
             #[inline(always)]
-            fn hash(index: u64) -> usize {
+            fn hash2index(index: u64) -> usize {
                 ((index >> 45) ^ (index >> 30) ^ (index >> 15) ^ index) as usize
             }
             const MASK: usize = HASH_SIZE - 1;
             let inode = &mut self.inode;
             let index = &mut self.index.as_mut_ptr();
-            let (mut miss, mut slot) = (0, hash(key.hash() >> 4) & MASK);
+            let (mut miss, mut slot) = (0, hash2index(key.hash() >> 4) & MASK);
             loop {
                 let node = get_mut_ref!(index, slot);
                 return if *node != u16::MAX {
@@ -727,14 +756,14 @@ mod bench {
                         node.1 += value;
                         #[cfg(feature = "hit_miss")]
                         HIS_MISS.with(|x| x.set(x.get() + miss));
-                    } else {
-                        miss += 1;
-                        if miss < HASH_SIZE {
-                            slot = (slot + 31) & MASK;
-                            continue;
-                        }
+                        break;
+                    }
+                    miss += 1;
+                    if miss == HASH_SIZE {
                         panic!("Map is full!");
                     }
+                    slot = (slot + 31) & MASK;
+                    continue;
                 } else {
                     *node = inode.len() as u16;
                     inode.push(MyWeatherNode(key, value.into()));
@@ -1053,10 +1082,7 @@ mod bench {
     pub fn decode_lines_a<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
         let mut group = Group::new(data);
         if dry_run {
-            group.for_each(
-                #[inline(always)]
-                |_| {},
-            )
+            group.for_each(drop)
         } else {
             group.for_each(
                 #[inline(always)]
@@ -1161,11 +1187,7 @@ mod bench {
             }
         }
         if dry_run {
-            for_each(
-                data,
-                #[inline(always)]
-                |_| {},
-            )
+            for_each(data, drop)
         } else {
             for_each(
                 data,
@@ -1229,26 +1251,41 @@ mod bench {
                         (value - BASE_MASK1) & !value & BASE_MASK2
                     }};
                 }
+                let wordx = FindBase::to_le(read_unaligned!(head, FindBase));
                 macro_rules! step {
-                    ($i: expr) => {{
-                        let tz0 = find!(BASE_MASK_CM, read_unaligned!(head, $i, FindBase));
-                        let tz1 = find!(
-                            BASE_MASK_CM,
-                            read_unaligned!(head, $i + BASE_SIZE, FindBase)
+                    () => {
+                        step!(
+                            0,
+                            wordx,
+                            FindBase::to_le(read_unaligned!(head, BASE_SIZE, FindBase))
                         );
+                    };
+                    ($i: expr) => {
+                        step!(
+                            $i,
+                            FindBase::to_le(read_unaligned!(head, $i, FindBase)),
+                            FindBase::to_le(read_unaligned!(head, $i + BASE_SIZE, FindBase))
+                        );
+                    };
+                    ($i: expr, $word1: expr, $word2: expr) => {{
+                        let tz0 = find!(BASE_MASK_CM, $word1);
+                        let tz1 = find!(BASE_MASK_CM, $word2);
+
                         if (tz0 | tz1) != 0 {
                             let i = (tz0 == 0) as usize;
-                            let off =
-                                [$i, BASE_SIZE][i] + ([tz0, tz1][i].trailing_zeros() >> 3) as usize;
-                            let len = (head as usize - mark as usize) + off;
-                            let name = unsafe { slice::from_raw_parts(mark, len) };
-                            ptr_inc!(head, off + 1);
-                            let tz2 = find!(BASE_MASK_NL, read_unaligned!(head, FindBase));
-                            let len = (tz2.trailing_zeros() >> 3) as usize;
-                            let value = unsafe { slice::from_raw_parts(head, len) };
-                            ptr_inc!(head, len + 1);
-                            mark = head;
-                            f((name.into(), parse_number(value)));
+                            let len = (head as usize - mark as usize)
+                                + $i
+                                + [0, BASE_SIZE][i]
+                                + ([tz0, tz1][i].trailing_zeros() >> 3) as usize;
+                            let city =
+                                City::new_ex(unsafe { slice::from_raw_parts(mark, len) }, wordx);
+                            ptr_inc!(mark, len + 1);
+                            let value = FindBase::to_le(read_unaligned!(mark, FindBase));
+                            let len = find!(BASE_MASK_NL, value).trailing_zeros() >> 3;
+                            let value = parse_number_ex(value, len);
+                            ptr_inc!(mark, len + 1);
+                            head = mark;
+                            f((city, value));
                             total += 1;
                             continue 'next;
                         }
@@ -1258,7 +1295,7 @@ mod bench {
                         }
                     }};
                 }
-                step!(0);
+                step!();
                 step!(BASE_SIZE * 2);
                 step!(BASE_SIZE * 4);
                 step!(BASE_SIZE * 6);
@@ -1304,11 +1341,7 @@ mod bench {
             total
         }
         if dry_run {
-            for_each(
-                data,
-                #[inline(always)]
-                |_| {},
-            )
+            for_each(data, drop)
         } else {
             for_each(
                 data,
@@ -1320,15 +1353,26 @@ mod bench {
 
     #[inline(always)]
     fn parse_number(value: &[u8]) -> Temperature {
+        let sign = (read!(value.as_ptr()) == b'-') as u32;
+        let value = u32::to_le(read_unaligned!(value.as_ptr(), sign, u32))
+            << ((sign + 4 - value.len() as u32) << 3);
+        parse_number_magic(value, sign)
+    }
+
+    #[inline(always)]
+    fn parse_number_ex(value: u64, len: u32) -> Temperature {
+        let sign = (value as u8 == b'-') as u32;
+        let value = ((value >> sign << 3) as u32) << ((sign + 4 - len) << 3);
+        parse_number_magic(value, sign)
+    }
+
+    #[inline(always)]
+    fn parse_number_magic(value: u32, sign: u32) -> Temperature {
         macro_rules! sign {
-            ($v:expr, $i: expr) => {{
-                const S_SHIFT: usize = (size_of::<i64>() << 3) - 1;
-                (($v) ^ ((($i) as i64) << S_SHIFT >> S_SHIFT) as u64) + $i as u64
-            }};
+            ($v:expr, $i: expr) => {
+                (($v) as i64 ^ -(($i) as i64)) + $i as i64
+            };
         }
-        let sign = (read!(value.as_ptr()) == b'-') as usize;
-        let value = u32::from_le(read_unaligned!(value.as_ptr(), sign, u32))
-            << ((sign + 4 - value.len()) << 3);
         sign!(
             ((((value & 0x0F000F0F) as u64).wrapping_mul(0x640A000100) >> 32) & 0x3FF),
             sign
@@ -1341,8 +1385,24 @@ mod bench {
             bench::{HIS_MISS, WeatherMap, decode_lines_c as decode_lines, parse_number},
             r#gen::Mmap,
         };
-        use std::{env::args, fs::File};
+        use clap::Parser;
+        use std::fs::File;
         extern crate test;
+
+        #[derive(Parser)]
+        struct BenchArg {
+            /// data file
+            #[arg(long, default_value = "./data/measurements.txt")]
+            data: String,
+
+            /// dry-run without map/reduce
+            #[arg(short, long)]
+            dry_run: bool,
+
+            /// data file in hugetlbfs
+            #[arg(long)]
+            hugepages: bool,
+        }
 
         #[test]
         pub fn test_parse_number() {
@@ -1423,13 +1483,13 @@ mod bench {
         #[bench]
         #[ignore]
         fn bench_reduce(b: &mut test::Bencher) {
-            let data = Mmap::open::<false>(File::open("./data/measurements.txt").unwrap()).unwrap();
+            let cli = BenchArg::parse();
+            let data = Mmap::open::<false>(File::open(cli.data).unwrap(), cli.hugepages).unwrap();
             let mut m = WeatherMap::default();
-            let dry_run = args().any(|x| x == "-dry-run" || x == "-d");
             b.iter(|| {
                 HIS_MISS.with(|x| {
                     x.set(0);
-                    decode_lines(&data, m.reset(), dry_run);
+                    decode_lines(&data, m.reset(), cli.dry_run);
                 });
             });
         }
@@ -1437,7 +1497,8 @@ mod bench {
         #[bench]
         #[ignore]
         fn bench_mmap(b: &mut test::Bencher) {
-            let data = Mmap::open::<false>(File::open("./data/measurements.txt").unwrap()).unwrap();
+            let cli = BenchArg::parse();
+            let data = Mmap::open::<false>(File::open(cli.data).unwrap(), cli.hugepages).unwrap();
             b.iter(|| {
                 let len = data.len();
                 let mut data_ptr = data.as_ptr();
