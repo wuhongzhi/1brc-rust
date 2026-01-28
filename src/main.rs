@@ -489,8 +489,16 @@ mod bench {
     use proc_cpuinfo::CpuInfo;
     use rayon::prelude::*;
     use std::{
-        cell::Cell, collections::BTreeMap, fmt::Display, fs::File, io::Write, mem::ManuallyDrop,
-        ops::AddAssign, ptr::null, thread, time::SystemTime,
+        cell::Cell,
+        collections::BTreeMap,
+        fmt::Display,
+        fs::File,
+        io::Write,
+        mem::ManuallyDrop,
+        ops::{AddAssign, IndexMut},
+        ptr::null,
+        thread,
+        time::SystemTime,
     };
 
     macro_rules! read {
@@ -506,10 +514,14 @@ mod bench {
             unsafe { ptr_add!($p, $i).cast::<$ty>().read_unaligned() }
         };
     }
-    #[derive(Clone, Copy, PartialOrd, Ord, Eq)]
+
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct Fingerprint(u8, u64);
+
+    #[derive(PartialOrd, Ord, Eq)]
     pub struct City<'a> {
+        data: Fingerprint,
         name: &'a [u8],
-        words: (u64, u64),
     }
     impl<'a> City<'a> {
         pub fn write(&self, buf: &mut Vec<u8>) {
@@ -521,22 +533,23 @@ mod bench {
         }
         #[inline(always)]
         fn new_ex(name: &'a [u8], mut word1: u64) -> Self {
+            let len = name.len();
             Self {
                 name,
-                words: if name.len() <= 8 {
-                    word1 <<= (8 - name.len()) << 3;
-                    (word1, word1.swap_bytes())
-                } else {
-                    (
-                        word1,
-                        u64::from_le(read_unaligned!(name.as_ptr(), name.len() - 8, u64)),
-                    )
-                },
+                data: Fingerprint(
+                    len as u8,
+                    if len <= 8 {
+                        word1 <<= (8 - len) << 3;
+                        word1 ^ word1.swap_bytes()
+                    } else {
+                        word1 ^ u64::from_le(read_unaligned!(name.as_ptr(), len - 8, u64))
+                    },
+                ),
             }
         }
         #[inline(always)]
         fn hash(&self) -> u64 {
-            self.words.0 ^ self.words.1
+            self.data.1
         }
     }
     impl<'a> From<&'a [u8]> for City<'a> {
@@ -547,7 +560,7 @@ mod bench {
     impl<'a> PartialEq for City<'a> {
         #[inline(always)]
         fn eq(&self, other: &Self) -> bool {
-            (self.name.len() == other.name.len()) && (self.words == other.words)
+            self.data == other.data
         }
     }
 
@@ -732,41 +745,37 @@ mod bench {
             }
             None
         }
+
         // TODO: refine this method
         #[inline(always)]
         pub fn put(&mut self, (key, value): (City<'a>, Temperature)) {
-            macro_rules! get_mut_ref {
-                ($e:expr, $i:expr) => {
-                    unsafe { &mut *$e.add($i) }
-                };
-            }
+            const SIZE_MASK: usize = HASH_SIZE - 1;
             #[inline(always)]
             fn hash2index(index: u64) -> usize {
-                ((index >> 45) ^ (index >> 30) ^ (index >> 15) ^ index) as usize
+                let half = (index ^ (index >> 30)) as u32;
+                (half ^ (half >> 15)) as usize & SIZE_MASK
             }
-            const MASK: usize = HASH_SIZE - 1;
-            let inode = &mut self.inode;
-            let index = &mut self.index.as_mut_ptr();
-            let (mut miss, mut slot) = (0, hash2index(key.hash() >> 4) & MASK);
+            let mut miss = 0;
+            let mut slot = hash2index(key.hash() >> 4);
             loop {
-                let node = get_mut_ref!(index, slot);
+                let node = self.index.index_mut(slot);
                 return if *node != u16::MAX {
-                    let node = get_mut_ref!(inode.as_mut_ptr(), *node as usize);
+                    let node = self.inode.index_mut(*node as usize);
                     if key.eq(&node.0) {
                         node.1 += value;
                         #[cfg(feature = "hit_miss")]
                         HIS_MISS.with(|x| x.set(x.get() + miss));
                         break;
                     }
-                    miss += 1;
-                    if miss == HASH_SIZE {
+                    if miss == SIZE_MASK {
                         panic!("Map is full!");
                     }
-                    slot = (slot + 31) & MASK;
+                    miss += 1;
+                    slot = (slot + 31) & SIZE_MASK;
                     continue;
                 } else {
-                    *node = inode.len() as u16;
-                    inode.push(MyWeatherNode(key, value.into()));
+                    *node = self.inode.len() as u16;
+                    self.inode.push(MyWeatherNode(key, value.into()));
                 };
             }
         }
@@ -908,7 +917,7 @@ mod bench {
     const CHR_NL: u8 = b'\n';
     const CHR_CM: u8 = b';';
     type FindBase = u64;
-    type FindSimd = std::simd::u64x4;
+    type FindSimd = std::simd::u64x2;
     //min 7 byets one solt (ab;y.z\n)
     const SIMD_SOLTS: usize = (size_of::<FindSimd>() as f32 / 7f32).ceil() as usize;
 
@@ -1274,8 +1283,7 @@ mod bench {
                         if (tz0 | tz1) != 0 {
                             let i = (tz0 == 0) as usize;
                             let len = (head as usize - mark as usize)
-                                + $i
-                                + [0, BASE_SIZE][i]
+                                + [$i, $i + BASE_SIZE][i]
                                 + ([tz0, tz1][i].trailing_zeros() >> 3) as usize;
                             let city =
                                 City::new_ex(unsafe { slice::from_raw_parts(mark, len) }, wordx);
