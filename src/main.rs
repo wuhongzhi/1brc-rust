@@ -13,7 +13,6 @@ use std::{
     io::{BufWriter, Read, Seek, SeekFrom, Write, stdout},
     mem::ManuallyDrop,
     os::fd::FromRawFd,
-    process::exit,
     time::SystemTime,
 };
 
@@ -233,34 +232,35 @@ fn generate(argv: GenerateArg) -> Result<()> {
 }
 
 fn bench(argv: BenchArg) -> Result<()> {
+    fn new_buf() -> ManuallyDrop<Vec<u8>> {
+        ManuallyDrop::new(Vec::with_capacity(512_000))
+    }
     let clock = SystemTime::now();
     let mut pipe_fds = [0i32; 2];
     unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
     match fork()? {
-        Fork::Parent(_child) => {
-            unsafe {
-                libc::fcntl(pipe_fds[0], libc::F_SETPIPE_SZ, 1 << 20);
-                libc::close(pipe_fds[1]);
-            }
+        Fork::Parent(child) => unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, child as u32, libc::PRIO_MIN);
+            libc::fcntl(pipe_fds[0], libc::F_SETPIPE_SZ, 1 << 20);
+            libc::close(pipe_fds[1]);
             let mut buf = new_buf();
-            let mut reader = unsafe { File::from_raw_fd(pipe_fds[0]) };
-            reader.read_to_end(&mut buf)?;
-            stdout().write_all(&buf)?;
-        }
-        Fork::Child => match Mmap::open::<false>(File::open(argv.data)?, argv.hugepages) {
-            Ok(data) => {
-                bench::reduce(&data, argv.slice, argv.workers, argv.dry_run, argv.mode)?
-                    .write(unsafe { File::from_raw_fd(pipe_fds[1]) }, new_buf())?
-                    .wait(clock)?;
-            }
-            Err(e) => {
-                eprintln!("{e:?}");
-            }
+            File::from_raw_fd(pipe_fds[0]).read_to_end(&mut buf)?;
+            stdout().lock().write_all(&buf)?;
+            libc::exit(0);
         },
-    }
-    exit(0);
-    fn new_buf() -> ManuallyDrop<Vec<u8>> {
-        ManuallyDrop::new(Vec::with_capacity(512_000))
+        Fork::Child => {
+            match Mmap::open::<false>(File::open(argv.data)?, argv.hugepages) {
+                Ok(data) => {
+                    bench::reduce(&data, argv.slice, argv.workers, argv.dry_run, argv.mode)?
+                        .write(unsafe { File::from_raw_fd(pipe_fds[1]) }, new_buf())?
+                        .wait(clock)?;
+                }
+                Err(e) => {
+                    eprintln!("{e:?}")
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -489,16 +489,8 @@ mod bench {
     use proc_cpuinfo::CpuInfo;
     use rayon::prelude::*;
     use std::{
-        cell::Cell,
-        collections::BTreeMap,
-        fmt::Display,
-        fs::File,
-        io::Write,
-        mem::ManuallyDrop,
-        ops::{AddAssign, IndexMut},
-        ptr::null,
-        thread,
-        time::SystemTime,
+        cell::Cell, collections::BTreeMap, fmt::Display, fs::File, io::Write, mem::ManuallyDrop,
+        ops::AddAssign, ptr::null, thread, time::SystemTime,
     };
 
     macro_rules! read {
@@ -515,12 +507,11 @@ mod bench {
         };
     }
 
-    #[derive(PartialEq, Eq, PartialOrd, Ord)]
-    struct Fingerprint(u8, u64);
+    type Fingerprint = (u32, u64);
 
     #[derive(PartialOrd, Ord, Eq)]
     pub struct City<'a> {
-        data: Fingerprint,
+        cmp: Fingerprint,
         name: &'a [u8],
     }
     impl<'a> City<'a> {
@@ -536,8 +527,8 @@ mod bench {
             let len = name.len();
             Self {
                 name,
-                data: Fingerprint(
-                    len as u8,
+                cmp: (
+                    len as u32,
                     if len <= 8 {
                         word1 <<= (8 - len) << 3;
                         word1 ^ word1.swap_bytes()
@@ -549,7 +540,7 @@ mod bench {
         }
         #[inline(always)]
         fn hash(&self) -> u64 {
-            self.data.1
+            self.cmp.1
         }
     }
     impl<'a> From<&'a [u8]> for City<'a> {
@@ -560,30 +551,31 @@ mod bench {
     impl<'a> PartialEq for City<'a> {
         #[inline(always)]
         fn eq(&self, other: &Self) -> bool {
-            self.data == other.data
+            self.cmp == other.cmp
         }
     }
 
-    type Temperature = isize;
-
+    type Temperature = i32;
     #[derive(Clone, Copy)]
     pub struct Weather {
-        count: u64,
-        sum: i64,
+        cnt: u32,
+        sum: i32,
         min: Temperature,
         max: Temperature,
+        cmp: Fingerprint,
     }
     impl Weather {
-        fn new(value: Temperature) -> Self {
+        fn new(value: (Fingerprint, Temperature)) -> Self {
             Self {
-                min: value,
-                max: value,
-                sum: value as i64,
-                count: 1,
+                cmp: value.0,
+                min: value.1,
+                max: value.1,
+                sum: value.1,
+                cnt: 1,
             }
         }
         fn write(&self, buf: &mut Vec<u8>) {
-            let mut avg = (self.sum as f64 / self.count as f64).round();
+            let mut avg = (self.sum as f64 / self.cnt as f64).round();
             if avg.abs() < 1.0 {
                 avg = 0f64;
             }
@@ -594,28 +586,28 @@ mod bench {
             buf.extend_from_slice((self.max as f64 / 10f64).format(1).as_bytes());
         }
     }
-    impl From<Temperature> for Weather {
-        fn from(value: Temperature) -> Self {
+    impl From<(Fingerprint, Temperature)> for Weather {
+        fn from(value: (Fingerprint, Temperature)) -> Self {
             Self::new(value)
         }
     }
     macro_rules! max_val {
         ($self: expr, $e: expr) => {{
             let this = &mut $self.max;
-            *this = (*this).max($e);
+            *this = [*this, $e][(*this < $e) as usize];
         }};
     }
     macro_rules! min_val {
         ($self: expr, $e: expr) => {{
             let this = &mut $self.min;
-            *this = ($e).min(*this);
+            *this = [*this, $e][(*this > $e) as usize];
         }};
     }
     impl AddAssign for Weather {
         #[inline(always)]
         fn add_assign(&mut self, other: Self) {
-            self.count += other.count;
             self.sum += other.sum;
+            self.cnt += other.cnt;
             max_val!(self, other.max);
             min_val!(self, other.min);
         }
@@ -623,8 +615,8 @@ mod bench {
     impl AddAssign<Temperature> for Weather {
         #[inline(always)]
         fn add_assign(&mut self, value: Temperature) {
-            self.count += 1;
-            self.sum += value as i64;
+            self.sum += value;
+            self.cnt += 1;
             max_val!(self, value);
             min_val!(self, value);
         }
@@ -709,18 +701,19 @@ mod bench {
     }
 
     pub type WeatherMap<'a> = MyWeatherMap<'a>;
-    pub struct MyWeatherNode<'a>(City<'a>, Weather);
 
     pub struct MyWeatherMap<'a> {
         index: [u16; HASH_SIZE],
-        inode: Vec<MyWeatherNode<'a>>,
+        weather: Vec<Weather>,
+        city: Vec<City<'a>>,
     }
 
     impl<'a> Default for MyWeatherMap<'a> {
         fn default() -> Self {
             MyWeatherMap {
                 index: [u16::MAX; HASH_SIZE],
-                inode: Vec::with_capacity(DEFULAT_CITIES),
+                weather: Vec::with_capacity(DEFULAT_CITIES),
+                city: Vec::with_capacity(DEFULAT_CITIES),
             }
         }
     }
@@ -731,16 +724,16 @@ mod bench {
     #[allow(dead_code)]
     impl<'a> MyWeatherMap<'a> {
         pub fn len(&self) -> usize {
-            self.inode.len()
+            self.city.len()
         }
         pub fn reset(&mut self) -> &mut Self {
             *self = Default::default();
             self
         }
         pub fn get(&self, city: &City<'static>) -> Option<Weather> {
-            for i in self.inode.iter() {
-                if i.0.eq(city) {
-                    return Some(i.1);
+            for (i, key) in self.city.iter().enumerate() {
+                if key.eq(city) {
+                    return Some(self.weather[i]);
                 }
             }
             None
@@ -748,7 +741,7 @@ mod bench {
 
         // TODO: refine this method
         #[inline(always)]
-        pub fn put(&mut self, (key, value): (City<'a>, Temperature)) {
+        pub fn put(&mut self, (city, value): (City<'a>, Temperature)) {
             const SIZE_MASK: usize = HASH_SIZE - 1;
             #[inline(always)]
             fn hash2index(index: u64) -> usize {
@@ -756,26 +749,28 @@ mod bench {
                 (half ^ (half >> 15)) as usize & SIZE_MASK
             }
             let mut miss = 0;
-            let mut slot = hash2index(key.hash() >> 4);
+            let mut slot = hash2index(city.hash() >> 4);
             loop {
-                let node = self.index.index_mut(slot);
-                return if *node != u16::MAX {
-                    let node = self.inode.index_mut(*node as usize);
-                    if key.eq(&node.0) {
-                        node.1 += value;
-                        #[cfg(feature = "hit_miss")]
-                        HIS_MISS.with(|x| x.set(x.get() + miss));
-                        break;
+                return match self.index[slot] {
+                    u16::MAX => {
+                        self.index[slot] = self.weather.len() as u16;
+                        self.weather.push((city.cmp, value).into());
+                        self.city.push(city);
                     }
-                    if miss == SIZE_MASK {
-                        panic!("Map is full!");
+                    index => {
+                        let hit = &mut self.weather[index as usize];
+                        if city.cmp == hit.cmp {
+                            *hit += value;
+                            #[cfg(feature = "hit_miss")]
+                            HIS_MISS.with(|x| x.set(x.get() + miss));
+                        } else if miss < SIZE_MASK {
+                            miss += 1;
+                            slot = (slot + 31) & SIZE_MASK;
+                            continue;
+                        } else {
+                            panic!("Map is full!");
+                        }
                     }
-                    miss += 1;
-                    slot = (slot + 31) & SIZE_MASK;
-                    continue;
-                } else {
-                    *node = self.inode.len() as u16;
-                    self.inode.push(MyWeatherNode(key, value.into()));
                 };
             }
         }
@@ -784,8 +779,8 @@ mod bench {
     impl<'a> From<MyWeatherMap<'a>> for BTreeMap<City<'a>, Weather> {
         fn from(val: MyWeatherMap<'a>) -> Self {
             let mut r = BTreeMap::default();
-            for i in val.inode {
-                r.insert(i.0, i.1);
+            for (i, city) in val.city.into_iter().enumerate() {
+                r.insert(city, val.weather[i]);
             }
             r
         }
@@ -803,9 +798,7 @@ mod bench {
                 .iter()
                 .enumerate()
                 .for_each(|(id, (city, weather))| {
-                    if id != 0 {
-                        buf.extend_from_slice(", ".as_bytes());
-                    }
+                    buf.extend_from_slice([", ", ""][(id == 0) as usize].as_bytes());
                     city.write(&mut buf);
                     buf.push(b'=');
                     weather.write(&mut buf);
@@ -1281,10 +1274,10 @@ mod bench {
                         let tz1 = find!(BASE_MASK_CM, $word2);
 
                         if (tz0 | tz1) != 0 {
-                            let i = (tz0 == 0) as usize;
+                            let i = (tz0 != 0) as usize;
                             let len = (head as usize - mark as usize)
-                                + [$i, $i + BASE_SIZE][i]
-                                + ([tz0, tz1][i].trailing_zeros() >> 3) as usize;
+                                + [$i + BASE_SIZE, $i][i]
+                                + ([tz1, tz0][i].trailing_zeros() >> 3) as usize;
                             let city =
                                 City::new_ex(unsafe { slice::from_raw_parts(mark, len) }, wordx);
                             ptr_inc!(mark, len + 1);
@@ -1398,6 +1391,7 @@ mod bench {
         extern crate test;
 
         #[derive(Parser)]
+        #[command(version, about)]
         struct BenchArg {
             /// data file
             #[arg(long, default_value = "./data/measurements.txt")]
@@ -1431,7 +1425,7 @@ mod bench {
             decode_lines(data, &mut m, false);
             assert_eq!(m.len(), 2);
             let r = m.get(&"aaaaaaaaa".as_bytes().into()).unwrap();
-            assert_eq!(r.count, 2);
+            assert_eq!(r.cnt, 2);
             assert_eq!(r.min, -100);
             assert_eq!(r.max, 260);
             assert_eq!(r.sum, 160);
