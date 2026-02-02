@@ -701,6 +701,7 @@ mod bench {
     }
 
     pub type WeatherMap<'a> = MyWeatherMap<'a>;
+    type Vec<T> = smallvec::alloc::vec::Vec<T>;
 
     pub struct MyWeatherMap<'a> {
         index: [u16; HASH_SIZE],
@@ -849,7 +850,7 @@ mod bench {
                     0 => decode_lines_a(part, &mut cities, dry_run),
                     1 => decode_lines_b(part, &mut cities, dry_run),
                     2 => decode_lines_c(part, &mut cities, dry_run),
-                    _ => 0,
+                    _ => decode_lines_d(part, &mut cities, dry_run),
                 };
                 let miss = HIS_MISS.with(|x| x.take());
                 if dry_run {
@@ -1301,6 +1302,121 @@ mod bench {
                 step!(BASE_SIZE * 4);
                 step!(BASE_SIZE * 6);
                 ptr_inc!(head, BASE_SIZE * 8);
+            }
+            'next: while head < end {
+                macro_rules! slice {
+                    () => {
+                        unsafe {
+                            let r = slice::from_raw_parts(mark, head as usize - mark as usize);
+                            ptr_inc!(head, 1);
+                            mark = head;
+                            r
+                        }
+                    };
+                }
+                match read!(head) {
+                    CHR_CM => {
+                        let city = slice!();
+                        while head < end {
+                            match read!(head) {
+                                CHR_NL => {
+                                    let value = slice!();
+                                    f((city.into(), parse_number(value)));
+                                    total += 1;
+                                    continue 'next;
+                                }
+                                _ => ptr_inc!(head, 1),
+                            }
+                        }
+                    }
+                    _ => ptr_inc!(head, 1),
+                }
+            }
+            #[cfg(feature = "hit_miss")]
+            {
+                eprintln!(
+                    "{:?} {:.3}%",
+                    thread::current().id(),
+                    100f64 * miss as f64 / total as f64
+                );
+            }
+            total
+        }
+        if dry_run {
+            for_each(data, drop)
+        } else {
+            for_each(
+                data,
+                #[inline(always)]
+                |v| result.put(v),
+            )
+        }
+    }
+
+    #[allow(unused_unsafe)]
+    pub fn decode_lines_d<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
+        fn for_each<'a, F>(data: &'a [u8], mut f: F) -> u64
+        where
+            F: FnMut((City<'a>, Temperature)),
+        {
+            let mut head = data.as_ptr();
+            let mut mark = head;
+            let end = ptr_add!(head, data.len());
+            let last = ptr_add!(end, -((BASE_SIZE * 8) as isize));
+            let mut total = 0u64;
+            #[cfg(feature = "hit_miss")]
+            let mut miss = 0;
+            while head <= last {
+                macro_rules! find {
+                    ($mask: expr, $input: expr) => {{
+                        let value = $mask ^ $input;
+                        (value - BASE_MASK1) & !value & BASE_MASK2
+                    }};
+                }
+                macro_rules! try_find {
+                    (0, $a:expr, $b:expr) => {{
+                        $a = find!(
+                            BASE_MASK_CM,
+                            FindBase::to_le(read_unaligned!(head, FindBase))
+                        );
+                        $b = find!(
+                            BASE_MASK_CM,
+                            FindBase::to_le(read_unaligned!(head, BASE_SIZE, FindBase))
+                        );
+                        ($a | $b) != 0
+                    }};
+                    (1, $a:expr, $b:expr) => {{
+                        ptr_inc!(head, BASE_SIZE * 2);
+                        try_find!(0, $a, $b)
+                    }};
+                }
+                let mut tz0;
+                let mut tz1;
+                if try_find!(0, tz0, tz1)
+                    || try_find!(1, tz0, tz1)
+                    || try_find!(1, tz0, tz1)
+                    || try_find!(1, tz0, tz1)
+                {
+                    let i = (tz0 != 0) as usize;
+                    let len = (head as usize - mark as usize)
+                        + [BASE_SIZE, 0][i]
+                        + ([tz1, tz0][i].trailing_zeros() >> 3) as usize;
+                    let city = City::new(unsafe { slice::from_raw_parts(mark, len) });
+                    ptr_inc!(mark, len + 1);
+                    let value = FindBase::to_le(read_unaligned!(mark, FindBase));
+                    let len = find!(BASE_MASK_NL, value).trailing_zeros() >> 3;
+                    let value = parse_number_ex(value, len);
+                    ptr_inc!(mark, len + 1);
+                    head = mark;
+                    f((city, value));
+                    total += 1;
+                } else {
+                    ptr_inc!(head, BASE_SIZE * 2);
+                    #[cfg(feature = "hit_miss")]
+                    {
+                        miss += 1;
+                    }
+                }
             }
             'next: while head < end {
                 macro_rules! slice {

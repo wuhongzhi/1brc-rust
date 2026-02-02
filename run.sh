@@ -14,6 +14,7 @@ if [ "$1" == "g" ]; then
         --release -- bench $@> /dev/null
 elif [ "$1" == 'd' ]; then
     shift
+    touch `readlink data/measurements.txt`
     cargo run --release -- gen $@
 else
     target=""
