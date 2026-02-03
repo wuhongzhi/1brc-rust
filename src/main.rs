@@ -25,24 +25,31 @@ macro_rules! ptr_inc {
     ($e: expr, $i: expr) => {
         $e = ($e as usize as isize + ($i)  as isize) as usize as *const u8
     };
+    ($x: expr, $e: expr, $i: expr) => {
+        ptr_inc!($e, $i);
+        $x = $e;
+    };
+}
+macro_rules! do_slice {
+    ($e:expr, $l:expr) => {
+        unsafe { slice::from_raw_parts($e, $l) }
+    };
 }
 macro_rules! pre_slice {
     ($d:expr, $i:expr) => {
-        unsafe { slice::from_raw_parts($d.as_ptr(), $i) }
+        do_slice!($d.as_ptr(), $i)
     };
 }
 macro_rules! pst_slice {
-    ($d:expr, $i:expr) => {
-        unsafe {
-            let off = $i;
-            let len = $d.len() - off;
-            slice::from_raw_parts(ptr_add!($d.as_ptr(), off), len)
-        }
-    };
+    ($d:expr, $i:expr) => {{
+        let off = $i;
+        let len = $d.len() - off;
+        do_slice!(ptr_add!($d.as_ptr(), off), len)
+    }};
 }
 macro_rules! mid_slice {
     ($d:expr, $s:expr, $e:expr) => {
-        unsafe { slice::from_raw_parts(ptr_add!($d.as_ptr(), $s), $e - ($s)) }
+        do_slice!(ptr_add!($d.as_ptr(), $s), $e - ($s))
     };
 }
 const HASH_SIZE: usize = 1 << 15;
@@ -486,7 +493,6 @@ mod bench {
     use crate::{DEFULAT_CITIES, HASH_SIZE};
     use anyhow::{Ok, Result};
     use core::slice;
-    use proc_cpuinfo::CpuInfo;
     use rayon::prelude::*;
     use std::{
         cell::Cell, collections::BTreeMap, fmt::Display, fs::File, io::Write, mem::ManuallyDrop,
@@ -878,14 +884,17 @@ mod bench {
         }
 
         let (cpu_cores, cache_size) = {
-            let proc = CpuInfo::read()?;
-            match proc.cpus().last() {
-                Some(cpu) => (
-                    workers.unwrap_or(cpu.processor().unwrap_or(0) + 1).max(1),
-                    cpu.cache_size().unwrap(),
-                ),
-                None => (1, 1 << 20),
-            }
+            let v = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as usize };
+            (workers.unwrap_or(v.max(1)), v * 1024 * 1024)
+            // use proc_cpuinfo::CpuInfo;
+            // let proc = CpuInfo::read()?;
+            // match proc.cpus().last() {
+            //     Some(cpu) => (
+            //         workers.unwrap_or(cpu.processor().unwrap_or(0) + 1).max(1),
+            //         cpu.cache_size().unwrap(),
+            //     ),
+            //     None => (1, 1 << 20),
+            // }
         };
         rayon::ThreadPoolBuilder::new()
             .thread_name(|i| format!("decode-worker-{i}"))
@@ -894,7 +903,7 @@ mod bench {
             .build_global()?;
         Ok(Reduce((
             Scanner::new(
-                unsafe { slice::from_raw_parts(data.as_ptr(), data.len()) },
+                do_slice!(data.as_ptr(), data.len()),
                 slice
                     .unwrap_or(data.len() / cpu_cores)
                     .max(cache_size / cpu_cores),
@@ -1054,7 +1063,7 @@ mod bench {
             let mut newline = self.leading;
             macro_rules! mid_slice {
                 ($s:expr, $e:expr) => {
-                    unsafe { slice::from_raw_parts($s, ($e as usize) - ($s as usize)) }
+                    do_slice!($s, ($e as usize) - ($s as usize))
                 };
             }
             let mut total = 0;
@@ -1147,7 +1156,7 @@ mod bench {
         {
             macro_rules! mid_slice {
                 ($s:expr, $e:expr) => {
-                    unsafe { slice::from_raw_parts($s, ($e as usize) - ($s as usize)) }
+                    do_slice!($s, ($e as usize) - ($s as usize))
                 };
             }
             let mut commas = [null(); SIMD_SOLTS];
@@ -1279,14 +1288,12 @@ mod bench {
                             let len = (head as usize - mark as usize)
                                 + [$i + BASE_SIZE, $i][i]
                                 + ([tz1, tz0][i].trailing_zeros() >> 3) as usize;
-                            let city =
-                                City::new_ex(unsafe { slice::from_raw_parts(mark, len) }, wordx);
+                            let city = City::new_ex(do_slice!(mark, len), wordx);
                             ptr_inc!(mark, len + 1);
                             let value = FindBase::to_le(read_unaligned!(mark, FindBase));
                             let len = find!(BASE_MASK_NL, value).trailing_zeros() >> 3;
                             let value = parse_number_ex(value, len);
-                            ptr_inc!(mark, len + 1);
-                            head = mark;
+                            ptr_inc!(head, mark, len + 1);
                             f((city, value));
                             total += 1;
                             continue 'next;
@@ -1305,14 +1312,11 @@ mod bench {
             }
             'next: while head < end {
                 macro_rules! slice {
-                    () => {
-                        unsafe {
-                            let r = slice::from_raw_parts(mark, head as usize - mark as usize);
-                            ptr_inc!(head, 1);
-                            mark = head;
-                            r
-                        }
-                    };
+                    () => {{
+                        let r = do_slice!(mark, head as usize - mark as usize);
+                        ptr_inc!(mark, head, 1);
+                        r
+                    }};
                 }
                 match read!(head) {
                     CHR_CM => {
@@ -1373,21 +1377,30 @@ mod bench {
                         (value - BASE_MASK1) & !value & BASE_MASK2
                     }};
                 }
+                let wordx;
                 macro_rules! try_find {
-                    (0, $a:expr, $b:expr) => {{
-                        $a = find!(
-                            BASE_MASK_CM,
-                            FindBase::to_le(read_unaligned!(head, FindBase))
-                        );
-                        $b = find!(
-                            BASE_MASK_CM,
-                            FindBase::to_le(read_unaligned!(head, BASE_SIZE, FindBase))
-                        );
+                    ($a:expr, $b:expr, $w1:expr, $w2:expr) => {{
+                        $a = find!(BASE_MASK_CM, $w1);
+                        $b = find!(BASE_MASK_CM, $w2);
                         ($a | $b) != 0
+                    }};
+                    (0, $a:expr, $b:expr) => {{
+                        wordx = FindBase::to_le(read_unaligned!(head, FindBase));
+                        try_find!(
+                            $a,
+                            $b,
+                            wordx,
+                            FindBase::to_le(read_unaligned!(head, BASE_SIZE, FindBase))
+                        )
                     }};
                     (1, $a:expr, $b:expr) => {{
                         ptr_inc!(head, BASE_SIZE * 2);
-                        try_find!(0, $a, $b)
+                        try_find!(
+                            $a,
+                            $b,
+                            FindBase::to_le(read_unaligned!(head, FindBase)),
+                            FindBase::to_le(read_unaligned!(head, BASE_SIZE, FindBase))
+                        )
                     }};
                 }
                 let mut tz0;
@@ -1401,13 +1414,12 @@ mod bench {
                     let len = (head as usize - mark as usize)
                         + [BASE_SIZE, 0][i]
                         + ([tz1, tz0][i].trailing_zeros() >> 3) as usize;
-                    let city = City::new(unsafe { slice::from_raw_parts(mark, len) });
+                    let city = City::new_ex(do_slice!(mark, len), wordx);
                     ptr_inc!(mark, len + 1);
                     let value = FindBase::to_le(read_unaligned!(mark, FindBase));
                     let len = find!(BASE_MASK_NL, value).trailing_zeros() >> 3;
                     let value = parse_number_ex(value, len);
-                    ptr_inc!(mark, len + 1);
-                    head = mark;
+                    ptr_inc!(head, mark, len + 1);
                     f((city, value));
                     total += 1;
                 } else {
@@ -1420,14 +1432,11 @@ mod bench {
             }
             'next: while head < end {
                 macro_rules! slice {
-                    () => {
-                        unsafe {
-                            let r = slice::from_raw_parts(mark, head as usize - mark as usize);
-                            ptr_inc!(head, 1);
-                            mark = head;
-                            r
-                        }
-                    };
+                    () => {{
+                        let r = do_slice!(mark, head as usize - mark as usize);
+                        ptr_inc!(mark, head, 1);
+                        r
+                    }};
                 }
                 match read!(head) {
                     CHR_CM => {
