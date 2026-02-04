@@ -496,7 +496,7 @@ mod bench {
     use rayon::prelude::*;
     use std::{
         cell::Cell, collections::BTreeMap, fmt::Display, fs::File, io::Write, mem::ManuallyDrop,
-        ops::AddAssign, ptr::null, thread, time::SystemTime,
+        ops::AddAssign, ptr::null, simd::cmp::SimdPartialEq, thread, time::SystemTime,
     };
 
     macro_rules! read {
@@ -513,7 +513,7 @@ mod bench {
         };
     }
 
-    type Fingerprint = (u32, u64);
+    type Fingerprint = (usize, u64);
 
     #[derive(PartialOrd, Ord, Eq)]
     pub struct City<'a> {
@@ -534,13 +534,13 @@ mod bench {
             Self {
                 name,
                 cmp: (
-                    len as u32,
+                    len,
                     if len <= 8 {
                         word1 <<= (8 - len) << 3;
-                        word1 ^ word1.swap_bytes()
+                        word1.swap_bytes()
                     } else {
-                        word1 ^ u64::from_le(read_unaligned!(name.as_ptr(), len - 8, u64))
-                    },
+                        u64::from_le(read_unaligned!(name.as_ptr(), len - 8, u64))
+                    } ^ word1,
                 ),
             }
         }
@@ -919,22 +919,12 @@ mod bench {
 
     const CHR_NL: u8 = b'\n';
     const CHR_CM: u8 = b';';
-    type FindBase = u64;
-    type FindSimd = std::simd::u64x2;
+    type FindSimd = std::simd::u8x16;
     //min 7 byets one solt (ab;y.z\n)
     const SIMD_SOLTS: usize = (size_of::<FindSimd>() as f32 / 7f32).ceil() as usize;
-
-    const BASE_SIZE: usize = size_of::<FindBase>();
-    const BASE_MASK_CM: FindBase = FindBase::from_ne_bytes([CHR_CM; BASE_SIZE]);
-    const BASE_MASK_NL: FindBase = FindBase::from_ne_bytes([CHR_NL; BASE_SIZE]);
-    const BASE_MASK1: FindBase = FindBase::from_ne_bytes([0x01; BASE_SIZE]);
-    const BASE_MASK2: FindBase = FindBase::from_ne_bytes([0x80; BASE_SIZE]);
-
     const FIND_SIZE: usize = size_of::<FindSimd>();
-    const FIND_MASK_CM: FindSimd = FindSimd::splat(BASE_MASK_CM);
-    const FIND_MASK_NL: FindSimd = FindSimd::splat(BASE_MASK_NL);
-    const FIND_MASK1: FindSimd = FindSimd::splat(BASE_MASK1);
-    const FIND_MASK2: FindSimd = FindSimd::splat(BASE_MASK2);
+    const FIND_MASK_CM: FindSimd = FindSimd::splat(CHR_CM);
+    const FIND_MASK_NL: FindSimd = FindSimd::splat(CHR_NL);
 
     struct Tokenizer<'a> {
         cache: [*const u8; SIMD_SOLTS],
@@ -1007,16 +997,16 @@ mod bench {
             let data_align = self.data_align;
             let mask = self.mask;
             while (cache_length == 0) & (data_ptr < data_align) {
-                let value = mask ^ read!(data_ptr.cast::<FindSimd>());
-                for mut x in ((value - FIND_MASK1) & !value & FIND_MASK2).to_array() {
-                    while x != 0 {
-                        let v = x.trailing_zeros();
-                        x ^= 1 << v;
-                        cache[cache_length] = ptr_add!(data_ptr, (v >> 3) as usize);
-                        cache_length += 1;
-                    }
-                    ptr_inc!(data_ptr, BASE_SIZE);
+                let mut x = mask
+                    .simd_eq(read!(data_ptr.cast::<FindSimd>()))
+                    .to_bitmask();
+                while x != 0 {
+                    let v = x.trailing_zeros();
+                    x ^= 1 << v;
+                    cache[cache_length] = ptr_add!(data_ptr, v);
+                    cache_length += 1;
                 }
+                ptr_inc!(data_ptr, FIND_SIZE);
             }
             self.data_ptr = data_ptr;
             self.cache_length = cache_length;
@@ -1108,16 +1098,16 @@ mod bench {
             // boost performance with simd
             let (mut count, last) = (0, ptr_add!($end_ptr, -(FIND_SIZE as isize)));
             while $data_ptr <= last {
-                let value = $mask ^ read_unaligned!($data_ptr, FindSimd);
-                for mut x in ((value - FIND_MASK1) & !value & FIND_MASK2).to_array() {
-                    while x != 0 {
-                        let v = x.trailing_zeros();
-                        x ^= 1 << v;
-                        $cache[count] = ptr_add!($data_ptr, (v >> 3) as usize);
-                        count += 1;
-                    }
-                    ptr_inc!($data_ptr, BASE_SIZE);
+                let mut x = $mask
+                    .simd_eq(read_unaligned!($data_ptr, FindSimd))
+                    .to_bitmask();
+                while x != 0 {
+                    let v = x.trailing_zeros();
+                    x ^= 1 << v;
+                    $cache[count] = ptr_add!($data_ptr, v);
+                    count += 1;
                 }
+                ptr_inc!($data_ptr, FIND_SIZE);
                 if count != 0 {
                     return count;
                 }
@@ -1214,12 +1204,13 @@ mod bench {
             // boost performance with swar
             let last = ptr_add!($end_ptr, -(FIND_SIZE as isize));
             while $data_ptr <= last {
-                let mut value = $mask ^ read_unaligned!($data_ptr, FindBase);
-                value = (value - BASE_MASK1) & !value & BASE_MASK2;
+                let value = $mask
+                    .simd_eq(read_unaligned!($data_ptr, FindSimd))
+                    .to_bitmask();
                 if value != 0 {
-                    return ptr_add!($data_ptr, (value.trailing_zeros() >> 3) as usize);
+                    return ptr_add!($data_ptr, value.trailing_zeros());
                 }
-                ptr_inc!($data_ptr, BASE_SIZE);
+                ptr_inc!($data_ptr, FIND_SIZE);
             }
             while $data_ptr < $end_ptr {
                 if read!($data_ptr) == $chr {
@@ -1240,8 +1231,8 @@ mod bench {
         };
     }
 
-    // define_find!(find_comma, CHR_CM, BASE_MASK_CM);
-    define_find!(find_newline, CHR_NL, BASE_MASK_NL);
+    // define_find!(find_comma, CHR_CM, FIND_MASK_CM);
+    define_find!(find_newline, CHR_NL, FIND_MASK_NL);
 
     #[allow(unused_unsafe)]
     pub fn decode_lines_c<'a>(data: &'a [u8], result: &mut WeatherMap<'a>, dry_run: bool) -> u64 {
@@ -1252,47 +1243,29 @@ mod bench {
             let mut head = data.as_ptr();
             let mut mark = head;
             let end = ptr_add!(head, data.len());
-            let last = ptr_add!(end, -((BASE_SIZE * 8) as isize));
+            let last = ptr_add!(end, -((FIND_SIZE * 4) as isize));
             let mut total = 0u64;
             #[cfg(feature = "hit_miss")]
             let mut miss = 0;
             'next: while head <= last {
                 macro_rules! find {
-                    ($mask: expr, $input: expr) => {{
-                        let value = $mask ^ $input;
-                        (value - BASE_MASK1) & !value & BASE_MASK2
-                    }};
+                    ($mask: expr, $input: expr) => {{ $mask.simd_eq($input).to_bitmask() }};
                 }
-                let wordx = FindBase::to_le(read_unaligned!(head, FindBase));
                 macro_rules! step {
-                    () => {
-                        step!(
-                            0,
-                            wordx,
-                            FindBase::to_le(read_unaligned!(head, BASE_SIZE, FindBase))
-                        );
-                    };
                     ($i: expr) => {
-                        step!(
-                            $i,
-                            FindBase::to_le(read_unaligned!(head, $i, FindBase)),
-                            FindBase::to_le(read_unaligned!(head, $i + BASE_SIZE, FindBase))
-                        );
+                        step!($i, read_unaligned!(head, $i, FindSimd));
                     };
-                    ($i: expr, $word1: expr, $word2: expr) => {{
-                        let tz0 = find!(BASE_MASK_CM, $word1);
-                        let tz1 = find!(BASE_MASK_CM, $word2);
+                    ($i: expr, $word1: expr) => {{
+                        let tz0 = find!(FIND_MASK_CM, $word1);
 
-                        if (tz0 | tz1) != 0 {
-                            let i = (tz0 != 0) as usize;
-                            let len = (head as usize - mark as usize)
-                                + [$i + BASE_SIZE, $i][i]
-                                + ([tz1, tz0][i].trailing_zeros() >> 3) as usize;
-                            let city = City::new_ex(do_slice!(mark, len), wordx);
+                        if tz0 != 0 {
+                            let len = (head as usize - mark as usize + $i)
+                                + tz0.trailing_zeros() as usize;
+                            let city = do_slice!(mark, len).into();
                             ptr_inc!(mark, len + 1);
-                            let value = FindBase::to_le(read_unaligned!(mark, FindBase));
-                            let len = find!(BASE_MASK_NL, value).trailing_zeros() >> 3;
-                            let value = parse_number_ex(value, len);
+                            let len = find!(FIND_MASK_NL, read_unaligned!(mark, FindSimd))
+                                .trailing_zeros() as usize;
+                            let value = parse_number(do_slice!(mark, len));
                             ptr_inc!(head, mark, len + 1);
                             f((city, value));
                             total += 1;
@@ -1304,11 +1277,11 @@ mod bench {
                         }
                     }};
                 }
-                step!();
-                step!(BASE_SIZE * 2);
-                step!(BASE_SIZE * 4);
-                step!(BASE_SIZE * 6);
-                ptr_inc!(head, BASE_SIZE * 8);
+                step!(0);
+                step!(FIND_SIZE);
+                step!(FIND_SIZE * 2);
+                step!(FIND_SIZE * 3);
+                ptr_inc!(head, FIND_SIZE * 4);
             }
             'next: while head < end {
                 macro_rules! slice {
@@ -1366,64 +1339,45 @@ mod bench {
             let mut head = data.as_ptr();
             let mut mark = head;
             let end = ptr_add!(head, data.len());
-            let last = ptr_add!(end, -((BASE_SIZE * 8) as isize));
+            let last = ptr_add!(end, -((FIND_SIZE * 4) as isize));
             let mut total = 0u64;
             #[cfg(feature = "hit_miss")]
             let mut miss = 0;
             while head <= last {
                 macro_rules! find {
-                    ($mask: expr, $input: expr) => {{
-                        let value = $mask ^ $input;
-                        (value - BASE_MASK1) & !value & BASE_MASK2
+                    ($mask: expr, $input: expr) => {
+                        $mask.simd_eq($input).to_bitmask()
+                    };
+                }
+                macro_rules! try_city {
+                    (0, $a:expr) => {{
+                        $a = find!(FIND_MASK_CM, read_unaligned!(head, FindSimd));
+                        $a != 0
+                    }};
+                    (1, $a:expr) => {{
+                        ptr_inc!(head, FIND_SIZE);
+                        try_city!(0, $a)
                     }};
                 }
-                let wordx;
-                macro_rules! try_find {
-                    ($a:expr, $b:expr, $w1:expr, $w2:expr) => {{
-                        $a = find!(BASE_MASK_CM, $w1);
-                        $b = find!(BASE_MASK_CM, $w2);
-                        ($a | $b) != 0
-                    }};
-                    (0, $a:expr, $b:expr) => {{
-                        wordx = FindBase::to_le(read_unaligned!(head, FindBase));
-                        try_find!(
-                            $a,
-                            $b,
-                            wordx,
-                            FindBase::to_le(read_unaligned!(head, BASE_SIZE, FindBase))
-                        )
-                    }};
-                    (1, $a:expr, $b:expr) => {{
-                        ptr_inc!(head, BASE_SIZE * 2);
-                        try_find!(
-                            $a,
-                            $b,
-                            FindBase::to_le(read_unaligned!(head, FindBase)),
-                            FindBase::to_le(read_unaligned!(head, BASE_SIZE, FindBase))
-                        )
-                    }};
+                macro_rules! try_value {
+                    () => {
+                        find!(FIND_MASK_NL, read_unaligned!(mark, FindSimd)).trailing_zeros()
+                            as usize
+                    };
                 }
                 let mut tz0;
-                let mut tz1;
-                if try_find!(0, tz0, tz1)
-                    || try_find!(1, tz0, tz1)
-                    || try_find!(1, tz0, tz1)
-                    || try_find!(1, tz0, tz1)
+                if try_city!(0, tz0) || try_city!(1, tz0) || try_city!(1, tz0) || try_city!(1, tz0)
                 {
-                    let i = (tz0 != 0) as usize;
-                    let len = (head as usize - mark as usize)
-                        + [BASE_SIZE, 0][i]
-                        + ([tz1, tz0][i].trailing_zeros() >> 3) as usize;
-                    let city = City::new_ex(do_slice!(mark, len), wordx);
+                    let len = (head as usize - mark as usize) + tz0.trailing_zeros() as usize;
+                    let city = do_slice!(mark, len).into();
                     ptr_inc!(mark, len + 1);
-                    let value = FindBase::to_le(read_unaligned!(mark, FindBase));
-                    let len = find!(BASE_MASK_NL, value).trailing_zeros() >> 3;
-                    let value = parse_number_ex(value, len);
+                    let len = try_value!();
+                    let value = parse_number(do_slice!(mark, len));
                     ptr_inc!(head, mark, len + 1);
                     f((city, value));
                     total += 1;
                 } else {
-                    ptr_inc!(head, BASE_SIZE * 2);
+                    ptr_inc!(head, FIND_SIZE);
                     #[cfg(feature = "hit_miss")]
                     {
                         miss += 1;
@@ -1482,13 +1436,6 @@ mod bench {
         let sign = (read!(value.as_ptr()) == b'-') as u32;
         let value = u32::to_le(read_unaligned!(value.as_ptr(), sign, u32))
             << ((sign + 4 - value.len() as u32) << 3);
-        parse_number_magic(value, sign)
-    }
-
-    #[inline(always)]
-    fn parse_number_ex(value: u64, len: u32) -> Temperature {
-        let sign = (value as u8 == b'-') as u32;
-        let value = ((value >> sign << 3) as u32) << ((sign + 4 - len) << 3);
         parse_number_magic(value, sign)
     }
 
