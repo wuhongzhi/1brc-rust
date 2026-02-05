@@ -1201,7 +1201,6 @@ mod bench {
 
     macro_rules! find_mask {
         ($chr:expr, $mask: expr, $data_ptr:expr, $end_ptr: expr) => {{
-            // boost performance with swar
             let last = ptr_add!($end_ptr, -(FIND_SIZE as isize));
             while $data_ptr <= last {
                 let value = $mask
@@ -1459,7 +1458,7 @@ mod bench {
             r#gen::Mmap,
         };
         use clap::Parser;
-        use std::fs::File;
+        use std::{fs::File, simd::cmp::SimdPartialEq};
         extern crate test;
 
         #[derive(Parser)]
@@ -1504,54 +1503,14 @@ mod bench {
         }
 
         #[test]
-        pub fn test_swar() {
-            fn fmt(mut v: String) -> String {
-                let mut i = v.len() - 8;
-                while i > 0 {
-                    v.insert(i, ' ');
-                    i -= 8;
-                }
-                v
-            }
-            macro_rules! e {
-                ($b: expr, $e:expr, $x: expr) => {
-                    $b.push_str(&format!(
-                        "{:>32} | {} | {}\n",
-                        stringify!($e),
-                        fmt(format!("{:032b}", $e)),
-                        $x
-                    ))
-                };
-                ($b: expr, $e:expr) => {
-                    $b.push_str(&format!("{:>32} | {}\n", stringify!($e), $e));
-                };
-            }
-            // boost performance with swar
-            const SIZE: usize = size_of::<u32>();
-            const MASK: u32 = u32::from_ne_bytes([b';'; SIZE]);
-            const MASK1: u32 = u32::from_ne_bytes([0x01; SIZE]);
-            const MASK2: u32 = u32::from_ne_bytes([0x80; SIZE]);
-            let mut arr = [b'1'; SIZE];
-            arr[SIZE - 2] = b';';
-            let mut value = u32::from_ne_bytes(arr);
-            let mut buf = String::new();
-
-            e!(buf, value, "");
-            e!(buf, MASK, "");
-            e!(buf, value ^ MASK, "=>value");
-            value ^= MASK;
-            e!(buf, MASK1, "");
-            e!(buf, (value - MASK1), "");
-            e!(buf, !value, "");
-            e!(buf, (value - MASK1) & !value, "");
-            e!(buf, MASK2, "");
-            e!(buf, (value - MASK1) & !value & MASK2, "");
-            value = (value - MASK1) & !value & MASK2;
-            e!(buf, value.trailing_zeros());
-            e!(buf, value.trailing_zeros() >> 3);
-            assert_eq!(value.trailing_zeros() >> 3, (SIZE - 2) as u32);
-
-            eprintln!("\n\n{}\n", buf.as_str());
+        pub fn test_simd() {
+            let mut arr = [b'1'; 4];
+            arr[2] = b';';
+            let pos = std::simd::u8x4::from_array([b';'; 4])
+                .simd_eq(std::simd::u8x4::from_array(arr))
+                .to_bitmask()
+                .trailing_zeros();
+            assert_eq!(pos, 2);
         }
 
         #[bench]
