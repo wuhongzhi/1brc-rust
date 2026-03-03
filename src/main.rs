@@ -758,14 +758,14 @@ mod bench {
             let mut miss = 0;
             let mut slot = hash2index(city.hash() >> 4);
             loop {
-                return match self.index[slot] {
+                return match unsafe { *self.index.as_ptr().add(slot) } {
                     u16::MAX => {
                         self.index[slot] = self.weather.len() as u16;
                         self.weather.push((city.cmp, value).into());
                         self.city.push(city);
                     }
                     index => {
-                        let hit = &mut self.weather[index as usize];
+                        let hit = unsafe { &mut *self.weather.as_mut_ptr().add(index as usize) };
                         if city.cmp == hit.cmp {
                             *hit += value;
                             #[cfg(feature = "hit_miss")]
